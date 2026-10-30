@@ -1,0 +1,1869 @@
+diff --git a/libfprint/drivers/egis0570touch-match.cpp b/libfprint/drivers/egis0570touch-match.cpp
+index 3468baca..f6dea69b 100644
+--- a/libfprint/drivers/egis0570touch-match.cpp
++++ b/libfprint/drivers/egis0570touch-match.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Descriptor matching for the ELAN 04f3:0c63
++ * High-pass NCC matching for the EgisTec 1c7a:0570 touch sensor.
+  * Copyright (C) 2026 Michael Brunner
+  *
+  * This library is free software; you can redistribute it and/or
+@@ -7,47 +7,68 @@
+  * License as published by the Free Software Foundation; either
+  * version 2.1 of the License, or (at your option) any later version.
+  *
+- * Adaptation note: the original ELAN measurements do not establish accuracy
+- * for this Egis sensor. All preprocessing constants remain experimental.
++ * On real hardware the previous SIFT/RANSAC matcher scored genuine
++ * same-finger presses at 0 (threshold 12): the sensor image is too small
++ * and low-contrast for stable keypoints. This replacement correlates whole
++ * images instead: background-subtract, crop the border, remove a slow
++ * Gaussian "shading" component (high-pass), denoise with a small blur,
++ * z-score, halve the resolution, then search a handful of rotations and
++ * every translation that still keeps at least half the area overlapping,
++ * reporting the largest normalised cross-correlation (NCC) found. This
++ * mirrors scripts/eval_matchers.py's hpimg()/ncc_shift() reference
++ * implementation closely enough that the two agree to within 0.02 on the
++ * same data (see REPORT2.md).
+  */
+ 
+ #include "egis0570touch-match.h"
+ 
+-#include <opencv2/calib3d.hpp>
+-#include <opencv2/features2d.hpp>
+ #include <opencv2/imgproc.hpp>
+ 
+ #include <algorithm>
+-#include <cstring>
+ #include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
+ #include <exception>
++#include <limits>
+ #include <memory>
+ #include <vector>
++#include <glib.h>
+ 
+ namespace {
+ 
+-/* Starting parameters inherited from the ELAN reference implementation.
+- * They have not been validated for Egis authentication accuracy. */
+-constexpr double kClaheClip = 3.0;
+-constexpr int kClaheGrid = 8;
+-
+-/* Enlarge the cropped 108x51 image before extracting SIFT descriptors. */
+-constexpr int kUpscale = 2;
+-constexpr double kSiftContrast = 0.04;
+-constexpr double kSiftEdge = 12.0;
+-constexpr double kSiftSigma = 1.2;
+-constexpr int kSiftOctaveLayers = 3;
+-constexpr float kRatio = 0.70f;
+-
+-/* Check descriptor correspondences against a similarity transform. */
+-constexpr double kRansacReproj = 3.0;
+-constexpr size_t kRansacMinMatches = 4;
+-
+-constexpr uint32_t kBlobMagic = 0x45543031; /* Egis experimental touch v1 */
+-constexpr uint16_t kBlobVersion = 1;
+-
+-constexpr int kWidth = EGIS0570TOUCH_WIDTH - 2 * EGIS0570TOUCH_BORDER;
+-constexpr int kHeight = EGIS0570TOUCH_HEIGHT - 2 * EGIS0570TOUCH_BORDER;
++/* Preprocessing, matching scripts/eval_matchers.py:hpimg() and the 0.5x
++ * resize applied before ncc_shift() in scripts/loo_eval.py. */
++constexpr double kHighpassSigma = 3.0;
++constexpr double kSmoothSigma = 0.8;
++constexpr double kLocalNormSigma = 4.0;
++constexpr double kDownscale = 0.5;
++
++/* A chosen frame whose cropped-signal standard deviation falls below this is
++ * treated as "no finger", not as a flat but genuine capture. Real presses in
++ * the reference dataset have a standard deviation several orders of
++ * magnitude above this; it only rejects degenerate all-background input. */
++constexpr double kMinSignalStd = 1e-3;
++
++/* Matching scripts/eval_matchers.py:ncc_shift() as called from
++ * scripts/loo_eval.py's second (overlap>=0.5) run, which is also the run
++ * whose measured numbers (genuine median 0.725, impostor max ~0.35 excluding
++ * the suspect B_other/1 press) motivate the 0.50 threshold below. */
++constexpr double kAngles[] = { -15, -10, -5, 0, 5, 10, 15 };
++constexpr double kMinOverlap = 0.5;
++
++/* Same statistical strictness as v2 at 0.50 (impostor mean + ~6.6 sd on
++ * datasets/collect1); see scripts/fusion_eval.py. */
++constexpr double kDefaultThreshold = 0.38;
++
++constexpr uint32_t kBlobMagic = 0x45543032; /* bytes spell "ET02" */
++constexpr uint16_t kBlobVersion = 3; /* v3: local contrast normalisation */
++/* Z-scored values are stored as int16 scaled by this factor; z-scores on
++ * this dataset stay within roughly +/-6, far inside int16 range. */
++constexpr float kQuantScale = 1000.0f;
++
++constexpr int kCropWidth = EGIS0570TOUCH_WIDTH - 2 * EGIS0570TOUCH_BORDER;
++constexpr int kCropHeight = EGIS0570TOUCH_HEIGHT - 2 * EGIS0570TOUCH_BORDER;
+ constexpr size_t kFramePixels =
+   static_cast<size_t> (EGIS0570TOUCH_WIDTH) * EGIS0570TOUCH_HEIGHT;
+ 
+@@ -65,6 +86,23 @@ write_u32_le (uint8_t *buffer, uint32_t value)
+   memcpy (buffer, &value, sizeof (value));
+ }
+ 
++void
++write_i16_le (uint8_t *buffer, int16_t value)
++{
++  uint16_t bits;
++  memcpy (&bits, &value, sizeof (bits));
++  write_u16_le (buffer, bits);
++}
++
++void
++write_float_le (uint8_t *buffer, float value)
++{
++  static_assert (sizeof (float) == sizeof (uint32_t));
++  uint32_t bits;
++  memcpy (&bits, &value, sizeof (bits));
++  write_u32_le (buffer, bits);
++}
++
+ uint16_t
+ read_u16_le (const uint8_t *buffer)
+ {
+@@ -81,13 +119,13 @@ read_u32_le (const uint8_t *buffer)
+   return GUINT32_FROM_LE (value);
+ }
+ 
+-void
+-write_float_le (uint8_t *buffer, float value)
++int16_t
++read_i16_le (const uint8_t *buffer)
+ {
+-  static_assert (sizeof (float) == sizeof (uint32_t));
+-  uint32_t bits;
+-  memcpy (&bits, &value, sizeof (bits));
+-  write_u32_le (buffer, bits);
++  uint16_t bits = read_u16_le (buffer);
++  int16_t value;
++  memcpy (&value, &bits, sizeof (value));
++  return value;
+ }
+ 
+ float
+@@ -99,112 +137,294 @@ read_float_le (const uint8_t *buffer)
+   return value;
+ }
+ 
+-/* Linear interpolated percentile, matching numpy's default so the C++ and the
+- * Python reference implementation agree on the same input. */
++/* Sum of positive (frame - background) over the cropped region: a cheap
++ * proxy for "how much finger signal is in this frame", used to pick the
++ * strongest frame of an enrollment press. */
+ double
+-percentile (std::vector<float> &sorted, double q)
++frame_strength (const uint16_t *frame, const uint16_t *background)
+ {
+-  if (sorted.empty ())
+-    return 0.0;
+-  const double pos = q / 100.0 * static_cast<double> (sorted.size () - 1);
+-  const size_t lo = static_cast<size_t> (pos);
+-  const size_t hi = std::min (lo + 1, sorted.size () - 1);
+-  return sorted[lo] + (pos - static_cast<double> (lo)) * (sorted[hi] - sorted[lo]);
++  double sum = 0.0;
++  for (int y = 0; y < kCropHeight; y++)
++    {
++      const size_t row = static_cast<size_t> (y + EGIS0570TOUCH_BORDER) * EGIS0570TOUCH_WIDTH;
++      for (int x = 0; x < kCropWidth; x++)
++        {
++          const size_t idx = row + x + EGIS0570TOUCH_BORDER;
++          const double d = static_cast<double> (frame[idx]) - static_cast<double> (background[idx]);
++          if (d > 0)
++            sum += d;
++        }
++    }
++  return sum;
+ }
+ 
+-/* Background subtraction, border crop, normalisation, upscale, CLAHE. */
++/* diff -> crop border -> high-pass (subtract a wide Gaussian blur) ->
++ * light denoise blur -> z-score -> half resolution. Returns an empty Mat if
++ * the frame has no measurable signal (background not subtracted away from
++ * itself, i.e. no finger). */
+ cv::Mat
+-prepare (const uint16_t *frame, const uint16_t *background)
++prepare_hp (const uint16_t *frame, const uint16_t *background)
+ {
+-  cv::Mat signal (kHeight, kWidth, CV_32F);
+-  std::vector<float> values;
+-  values.reserve (static_cast<size_t> (kHeight) * kWidth);
+-
+-  for (int y = 0; y < kHeight; y++)
++  cv::Mat cropped (kCropHeight, kCropWidth, CV_32F);
++  for (int y = 0; y < kCropHeight; y++)
+     {
+-      for (int x = 0; x < kWidth; x++)
++      float *row = cropped.ptr<float> (y);
++      const size_t base = static_cast<size_t> (y + EGIS0570TOUCH_BORDER) * EGIS0570TOUCH_WIDTH;
++      for (int x = 0; x < kCropWidth; x++)
+         {
+-          const size_t idx =
+-            static_cast<size_t> (y + EGIS0570TOUCH_BORDER) * EGIS0570TOUCH_WIDTH +
+-            (x + EGIS0570TOUCH_BORDER);
+-          /* Kept signed: the difference is genuinely negative in the valleys,
+-           * and clamping it away costs contrast. */
+-          const float v = static_cast<float> (frame[idx]) -
+-                          static_cast<float> (background[idx]);
+-          signal.at<float> (y, x) = v;
+-          values.push_back (v);
++          const size_t idx = base + x + EGIS0570TOUCH_BORDER;
++          row[x] = static_cast<float> (frame[idx]) - static_cast<float> (background[idx]);
+         }
+     }
+ 
+-  std::sort (values.begin (), values.end ());
+-  const double lo = percentile (values, 1.0);
+-  const double hi = percentile (values, 99.0);
+-  const double span = std::max (hi - lo, 1e-9);
++  cv::Mat lowpass;
++  cv::GaussianBlur (cropped, lowpass, cv::Size (0, 0), kHighpassSigma);
++  cv::Mat highpass = cropped - lowpass;
++
++  cv::Mat smoothed;
++  cv::GaussianBlur (highpass, smoothed, cv::Size (0, 0), kSmoothSigma);
++
++  cv::Scalar mean, stddev;
++  cv::meanStdDev (smoothed, mean, stddev);
++  if (stddev[0] < kMinSignalStd)
++    return cv::Mat ();
++
++  /* Local contrast normalisation: divide by the local RMS ridge amplitude so
++   * that pressure / dryness differences across the touch do not dominate the
++   * correlation (scripts/acc_harness.py:pre_localnorm, ln=4). */
++  cv::Mat energy;
++  cv::GaussianBlur (smoothed.mul (smoothed), energy, cv::Size (0, 0), kLocalNormSigma);
++  cv::sqrt (energy, energy);
++  energy += 1e-3 * stddev[0];
++  cv::Mat normed = smoothed / energy;
++  cv::meanStdDev (normed, mean, stddev);
++
++  cv::Mat z = (normed - mean[0]) / (stddev[0] + 1e-9);
++
++  cv::Mat half;
++  cv::resize (z, half, cv::Size (), kDownscale, kDownscale, cv::INTER_LINEAR);
++  return half;
++}
++
++/* Normalised cross-correlation of @a against @b over rotations of @b
++ * (kAngles) and every translation (|dy| <= h/2, |dx| <= w/2) that keeps at
++ * least kMinOverlap of the area in common, computed for all shifts at once
++ * with FFT-based masked NCC (Padfield, "Masked object registration in the
++ * Fourier domain", IEEE TIP 2012). Rotated-out pixels of @b are masked, so
++ * every shift's Pearson correlation is over exactly the valid overlap --
++ * numerically identical (to ~1e-7) to the brute-force definition in
++ * scripts/acc_harness.py:ncc_shift, verified by scripts/fftncc.py. */
++
++/* Probe side: spectra of the image and its square. */
++struct ProbeSpectrum
++{
++  int h = 0, w = 0, H = 0, W = 0;
++  cv::Mat val, sq; /* CV_64FC2 */
++};
+ 
+-  cv::Mat scaled (kHeight, kWidth, CV_8U);
+-  for (int y = 0; y < kHeight; y++)
+-    for (int x = 0; x < kWidth; x++)
+-      {
+-        double t = (signal.at<float> (y, x) - lo) / span;
+-        t = std::clamp (t, 0.0, 1.0);
+-        scaled.at<uint8_t> (y, x) = static_cast<uint8_t> (t * 255.0);
+-      }
++/* Gallery side, one per rotation: spectra of the validity mask and of the
++ * masked image, plus the three probe-independent correlation maps (the
++ * probe's own mask is all ones, identical for every probe of this size). */
++struct GalleryRotation
++{
++  cv::Mat one, val;  /* CV_64FC2 spectra */
++  cv::Mat n, sb, sbb; /* CV_64F spatial maps, indexed by shift mod (H, W) */
++};
++
++struct GallerySpectrum
++{
++  int h = 0, w = 0, H = 0, W = 0;
++  std::vector<GalleryRotation> rotations;
++};
+ 
+-  cv::Mat upscaled;
+-  cv::resize (scaled, upscaled, cv::Size (), kUpscale, kUpscale, cv::INTER_CUBIC);
++cv::Mat
++padded_dft (const cv::Mat &x, int H, int W)
++{
++  cv::Mat p = cv::Mat::zeros (H, W, CV_64F);
++  x.copyTo (p (cv::Rect (0, 0, x.cols, x.rows)));
++  cv::Mat f;
++  cv::dft (p, f, cv::DFT_COMPLEX_OUTPUT);
++  return f;
++}
+ 
+-  cv::Mat equalised;
+-  cv::createCLAHE (kClaheClip, cv::Size (kClaheGrid, kClaheGrid))
+-    ->apply (upscaled, equalised);
++/* c(s) = sum_p X(p + s) Y(p), s taken modulo (H, W). */
++cv::Mat
++xcorr (const cv::Mat &FX, const cv::Mat &FY)
++{
++  cv::Mat prod, r;
++  cv::mulSpectrums (FX, FY, prod, 0, true);
++  cv::idft (prod, r, cv::DFT_REAL_OUTPUT | cv::DFT_SCALE);
++  return r;
++}
+ 
+-  return equalised;
++ProbeSpectrum
++probe_spectrum (const cv::Mat &a32)
++{
++  ProbeSpectrum s;
++  s.h = a32.rows; s.w = a32.cols;
++  s.H = cv::getOptimalDFTSize (2 * s.h);
++  s.W = cv::getOptimalDFTSize (2 * s.w);
++  cv::Mat a;
++  a32.convertTo (a, CV_64F);
++  s.val = padded_dft (a, s.H, s.W);
++  s.sq = padded_dft (a.mul (a), s.H, s.W);
++  return s;
++}
++
++GallerySpectrum
++gallery_spectrum (const cv::Mat &b32)
++{
++  GallerySpectrum out;
++  const int h = b32.rows, w = b32.cols;
++  out.h = h; out.w = w;
++  out.H = cv::getOptimalDFTSize (2 * h);
++  out.W = cv::getOptimalDFTSize (2 * w);
++  const cv::Mat ones = padded_dft (cv::Mat::ones (h, w, CV_64F), out.H, out.W);
++  for (double angle : kAngles)
++    {
++      cv::Mat rot = cv::getRotationMatrix2D (cv::Point2f (w / 2.0f, h / 2.0f), angle, 1.0);
++      cv::Mat br;
++      cv::warpAffine (b32, br, rot, cv::Size (w, h), cv::INTER_LINEAR, cv::BORDER_CONSTANT,
++                     cv::Scalar (std::numeric_limits<float>::quiet_NaN ()));
++      cv::Mat mask (h, w, CV_64F), bz (h, w, CV_64F);
++      for (int y = 0; y < h; y++)
++        {
++          const float *src = br.ptr<float> (y);
++          double *m = mask.ptr<double> (y), *z = bz.ptr<double> (y);
++          for (int x = 0; x < w; x++)
++            {
++              const bool ok = !std::isnan (src[x]);
++              m[x] = ok ? 1.0 : 0.0;
++              z[x] = ok ? src[x] : 0.0;
++            }
++        }
++      GalleryRotation r;
++      r.one = padded_dft (mask, out.H, out.W);
++      r.val = padded_dft (bz, out.H, out.W);
++      const cv::Mat sq = padded_dft (bz.mul (bz), out.H, out.W);
++      r.n = xcorr (ones, r.one);
++      r.sb = xcorr (ones, r.val);
++      r.sbb = xcorr (ones, sq);
++      out.rotations.push_back (std::move (r));
++    }
++  return out;
++}
++
++double
++ncc_masked_fft (const ProbeSpectrum &a, const GallerySpectrum &g)
++{
++  const int h = a.h, w = a.w, H = a.H, W = a.W;
++  if (g.h != h || g.w != w || g.H != H || g.W != W)
++    return 0.0;
++  const double need = kMinOverlap * h * w;
++  const int max_dy = h / 2, max_dx = w / 2;
++  double best = -1.0;
++
++  for (const GalleryRotation &r : g.rotations)
++    {
++      const cv::Mat sa = xcorr (a.val, r.one);
++      const cv::Mat saa = xcorr (a.sq, r.one);
++      const cv::Mat sab = xcorr (a.val, r.val);
++      for (int dy = -max_dy; dy <= max_dy; dy++)
++        {
++          const int iy = (dy % H + H) % H;
++          const double hh = h - std::abs (dy);
++          for (int dx = -max_dx; dx <= max_dx; dx++)
++            {
++              if (hh * (w - std::abs (dx)) < need)
++                continue;
++              const int ix = (dx % W + W) % W;
++              const double cnt = std::round (r.n.at<double> (iy, ix));
++              if (cnt < need)
++                continue;
++              const double Sa = sa.at<double> (iy, ix), Sb = r.sb.at<double> (iy, ix);
++              const double cov = sab.at<double> (iy, ix) - Sa * Sb / cnt;
++              const double va = std::max (saa.at<double> (iy, ix) - Sa * Sa / cnt, 0.0);
++              const double vb = std::max (r.sbb.at<double> (iy, ix) - Sb * Sb / cnt, 0.0);
++              const double v = cov / std::sqrt (va * vb + 1e-9);
++              if (v > best)
++                best = v;
++            }
++        }
++    }
++  return best;
+ }
+ 
+ } /* namespace */
+ 
+ struct _Egis0570TouchFeatures
+ {
+-  std::vector<cv::KeyPoint> keypoints;
+-  cv::Mat descriptors;   /* CV_32F, one row per keypoint */
++  cv::Mat image; /* CV_32F, half resolution, z-scored high-pass signal */
++  /* Lazily computed FFT spectra (see ncc_masked_fft). */
++  bool have_probe = false, have_gallery = false;
++  ProbeSpectrum probe;
++  GallerySpectrum gallery;
+ };
+ 
++double
++fpi_egis0570touch_frame_strength (const uint16_t *frame, const uint16_t *background)
++{
++  if (frame == nullptr || background == nullptr)
++    return 0.0;
++  return frame_strength (frame, background);
++}
++
++void
++fpi_egis0570touch_dump_frames (const char *tag, const uint16_t *frames, guint frame_count,
++                               const uint16_t *background)
++{
++  const char *dir = getenv ("EGIS0570_DUMP_DIR");
++  if (!dir || !frames || !background)
++    return;
++  const long long t = static_cast<long long> (g_get_real_time ());
++  for (guint i = 0; i < frame_count; i++)
++    {
++      char path[512];
++      snprintf (path, sizeof path, "%s/%lld_%s_f%02u_raw.pgm", dir, t, tag ? tag : "x", i);
++      FILE *f = fopen (path, "wb");
++      if (!f)
++        return;
++      fprintf (f, "P5\n%d %d\n65535\n", EGIS0570TOUCH_WIDTH, EGIS0570TOUCH_HEIGHT * 2);
++      const uint16_t *frame = frames + static_cast<size_t> (i) * kFramePixels;
++      for (size_t k = 0; k < kFramePixels; k++)
++        { fputc (frame[k] >> 8, f); fputc (frame[k] & 255, f); }
++      for (size_t k = 0; k < kFramePixels; k++)
++        { fputc (background[k] >> 8, f); fputc (background[k] & 255, f); }
++      fclose (f);
++    }
++}
++
+ Egis0570TouchFeatures *
+ fpi_egis0570touch_features_extract (const uint16_t *frames,
+                                   guint           frame_count,
+-                                  const uint16_t *background) try
++                                  const uint16_t *background,
++                                  gboolean        prefer_strongest) try
+ {
+   if (frames == nullptr || background == nullptr || frame_count == 0)
+     return nullptr;
+ 
+-  auto sift = cv::SIFT::create (0, kSiftOctaveLayers, kSiftContrast,
+-                                kSiftEdge, kSiftSigma);
+-
+-  std::vector<cv::KeyPoint> best_keypoints;
+-  cv::Mat best_descriptors;
+-
+-  /* Experimental selection heuristic: retain the most keypoints.
+-   * Keypoint count does not guarantee image quality or matching accuracy. */
+-  for (guint i = 0; i < frame_count; i++)
++  guint chosen = frame_count - 1;
++  if (prefer_strongest)
+     {
+-      const cv::Mat image = prepare (frames + i * kFramePixels, background);
+-
+-      std::vector<cv::KeyPoint> keypoints;
+-      cv::Mat descriptors;
+-      sift->detectAndCompute (image, cv::noArray (), keypoints, descriptors);
+-
+-      if (keypoints.size () > best_keypoints.size ())
++      double best = -1.0;
++      for (guint i = 0; i < frame_count; i++)
+         {
+-          best_keypoints = std::move (keypoints);
+-          best_descriptors = descriptors.clone ();
++          const double s = frame_strength (frames + i * kFramePixels, background);
++          if (s > best)
++            {
++              best = s;
++              chosen = i;
++            }
+         }
+     }
+ 
+-  if (best_keypoints.empty ())
++  const uint16_t *frame = frames + chosen * kFramePixels;
++  cv::Mat half = prepare_hp (frame, background);
++  if (half.empty ())
+     return nullptr;
+ 
+   auto features = std::make_unique<_Egis0570TouchFeatures> ();
+-  features->keypoints = std::move (best_keypoints);
+-  features->descriptors = std::move (best_descriptors);
++  features->image = std::move (half);
+   return features.release ();
+ }
+ catch (const std::exception &)
+@@ -213,56 +433,49 @@ catch (const std::exception &)
+   return nullptr;
+ }
+ 
+-guint
+-fpi_egis0570touch_features_keypoint_count (Egis0570TouchFeatures *features)
+-{
+-  return features ? static_cast<guint> (features->keypoints.size ()) : 0;
+-}
+-
+ /* Blob layout, little endian:
+- *   magic u32 | version u16 | count u16 | count * (x f32, y f32) | count * 128 u8
++ *   magic u32 | version u16 | width u16 | height u16 | reserved u16 |
++ *   resize_scale f32 | quant_scale f32 | width*height * (int16 LE)
+  *
+- * Only the coordinates are kept from each keypoint; scale, angle and response
+- * are not needed once the descriptor exists. Descriptors are stored as bytes:
+- * SIFT descriptors are rounded and clamped to bytes. This is the existing
+- * version-1 format; changing it would require template migration.
++ * Pixel values are the z-scored high-pass signal, quantised by multiplying
++ * by quant_scale and rounding to the nearest int16. This is version 2 of
++ * the format; version 1 (SIFT keypoints/descriptors) is a different, now
++ * unsupported, encoding -- fpi_egis0570touch_features_deserialise() rejects
++ * it so old templates score 0 against every sample until the user
++ * re-enrolls, rather than being misinterpreted as image data.
+  */
+ GBytes *
+ fpi_egis0570touch_features_serialise (Egis0570TouchFeatures *features) try
+ {
+-  if (features == nullptr || features->keypoints.empty () ||
+-      features->descriptors.cols != 128)
++  if (features == nullptr || features->image.empty ())
+     return nullptr;
+ 
+-  const uint16_t count = static_cast<uint16_t> (
+-    std::min<size_t> (features->keypoints.size (), 4096));
+-
+-  const size_t size = 4 + 2 + 2 +
+-                      static_cast<size_t> (count) * 2 * sizeof (float) +
+-                      static_cast<size_t> (count) * 128;
++  const int width = features->image.cols;
++  const int height = features->image.rows;
++  const size_t pixels = static_cast<size_t> (width) * height;
++  const size_t size = 20 + pixels * sizeof (int16_t);
+ 
+   g_autofree uint8_t *buffer = static_cast<uint8_t *> (g_malloc (size));
+   size_t offset = 0;
+ 
+   write_u32_le (buffer + offset, kBlobMagic); offset += 4;
+   write_u16_le (buffer + offset, kBlobVersion); offset += 2;
+-  write_u16_le (buffer + offset, count); offset += 2;
+-
+-  for (uint16_t i = 0; i < count; i++)
+-    {
+-      write_float_le (buffer + offset, features->keypoints[i].pt.x);
+-      offset += sizeof (float);
+-      write_float_le (buffer + offset, features->keypoints[i].pt.y);
+-      offset += sizeof (float);
+-    }
++  write_u16_le (buffer + offset, static_cast<uint16_t> (width)); offset += 2;
++  write_u16_le (buffer + offset, static_cast<uint16_t> (height)); offset += 2;
++  write_u16_le (buffer + offset, 0); offset += 2; /* reserved */
++  write_float_le (buffer + offset, static_cast<float> (kDownscale)); offset += 4;
++  write_float_le (buffer + offset, kQuantScale); offset += 4;
+ 
+-  for (uint16_t i = 0; i < count; i++)
++  for (int y = 0; y < height; y++)
+     {
+-      const float *row = features->descriptors.ptr<float> (i);
+-      for (int d = 0; d < 128; d++)
+-        buffer[offset + d] = static_cast<uint8_t> (
+-          std::clamp (static_cast<int> (row[d] + 0.5f), 0, 255));
+-      offset += 128;
++      const float *row = features->image.ptr<float> (y);
++      for (int x = 0; x < width; x++)
++        {
++          const float scaled = row[x] * kQuantScale;
++          const float clamped = std::clamp (scaled, -32767.0f, 32767.0f);
++          write_i16_le (buffer + offset, static_cast<int16_t> (std::lround (clamped)));
++          offset += sizeof (int16_t);
++        }
+     }
+ 
+   return g_bytes_new_take (g_steal_pointer (&buffer), size);
+@@ -280,46 +493,40 @@ fpi_egis0570touch_features_deserialise (GBytes *blob) try
+   gsize size = 0;
+   const auto *buffer = static_cast<const uint8_t *> (g_bytes_get_data (blob, &size));
+ 
+-  if (buffer == nullptr || size < 8)
++  if (buffer == nullptr || size < 20)
+     return nullptr;
+ 
+   const uint32_t magic = read_u32_le (buffer);
+   const uint16_t version = read_u16_le (buffer + 4);
+-  const uint16_t count = read_u16_le (buffer + 6);
++  const uint16_t width = read_u16_le (buffer + 6);
++  const uint16_t height = read_u16_le (buffer + 8);
++  const float resize_scale = read_float_le (buffer + 12);
++  const float quant_scale = read_float_le (buffer + 16);
+ 
+-  if (magic != kBlobMagic || version != kBlobVersion || count == 0 || count > 4096)
++  if (magic != kBlobMagic || version != kBlobVersion)
++    return nullptr;
++  if (width == 0 || height == 0 || width > 4096 || height > 4096)
++    return nullptr;
++  if (!std::isfinite (resize_scale) || !std::isfinite (quant_scale) || quant_scale <= 0)
+     return nullptr;
+ 
+-  const size_t expected = 8 + static_cast<size_t> (count) * 2 * sizeof (float) +
+-                          static_cast<size_t> (count) * 128;
++  const size_t pixels = static_cast<size_t> (width) * height;
++  const size_t expected = 20 + pixels * sizeof (int16_t);
+   if (size != expected)
+     return nullptr;
+ 
+   auto features = std::make_unique<_Egis0570TouchFeatures> ();
+-  features->keypoints.reserve (count);
+-  features->descriptors = cv::Mat (count, 128, CV_32F);
+-
+-  size_t offset = 8;
+-  for (uint16_t i = 0; i < count; i++)
+-    {
+-      float xy[2];
+-      xy[0] = read_float_le (buffer + offset);
+-      offset += sizeof (float);
+-      xy[1] = read_float_le (buffer + offset);
+-      offset += sizeof (float);
+-      if (!std::isfinite (xy[0]) || !std::isfinite (xy[1]) ||
+-          xy[0] < 0 || xy[1] < 0 ||
+-          xy[0] >= kWidth * kUpscale || xy[1] >= kHeight * kUpscale)
+-        return nullptr;
+-      features->keypoints.emplace_back (cv::Point2f (xy[0], xy[1]), 1.0f);
+-    }
++  features->image = cv::Mat (height, width, CV_32F);
+ 
+-  for (uint16_t i = 0; i < count; i++)
++  size_t offset = 20;
++  for (int y = 0; y < height; y++)
+     {
+-      float *row = features->descriptors.ptr<float> (i);
+-      for (int d = 0; d < 128; d++)
+-        row[d] = static_cast<float> (buffer[offset + d]);
+-      offset += 128;
++      float *row = features->image.ptr<float> (y);
++      for (int x = 0; x < width; x++)
++        {
++          row[x] = static_cast<float> (read_i16_le (buffer + offset)) / quant_scale;
++          offset += sizeof (int16_t);
++        }
+     }
+ 
+   return features.release ();
+@@ -329,51 +536,33 @@ catch (const std::exception &)
+   return nullptr;
+ }
+ 
+-guint
++double
+ fpi_egis0570touch_features_compare (Egis0570TouchFeatures *probe,
+                                   Egis0570TouchFeatures *gallery) try
+ {
+   if (probe == nullptr || gallery == nullptr)
+-    return 0;
+-  if (probe->descriptors.rows < 2 || gallery->descriptors.rows < 2)
+-    return 0;
+-
+-  std::vector<std::vector<cv::DMatch> > candidates;
+-  cv::BFMatcher (cv::NORM_L2).knnMatch (probe->descriptors,
+-                                        gallery->descriptors,
+-                                        candidates, 2);
+-
+-  /* Ridge patterns are highly self-similar, so most nearest neighbours are
+-   * ambiguous. The ratio test discards those; what survives still has to pass
+-   * the geometric check below. */
+-  std::vector<cv::Point2f> source, target;
+-  for (const auto &pair : candidates)
++    return 0.0;
++  if (probe->image.empty () || gallery->image.empty ())
++    return 0.0;
++  if (probe->image.rows != gallery->image.rows || probe->image.cols != gallery->image.cols)
++    return 0.0;
++
++  if (!probe->have_probe)
+     {
+-      if (pair.size () < 2)
+-        continue;
+-      if (pair[0].distance >= kRatio * pair[1].distance)
+-        continue;
+-      source.push_back (probe->keypoints[pair[0].queryIdx].pt);
+-      target.push_back (gallery->keypoints[pair[0].trainIdx].pt);
++      probe->probe = probe_spectrum (probe->image);
++      probe->have_probe = true;
+     }
+-
+-  if (source.size () < kRansacMinMatches)
+-    return 0;
+-
+-  /* Count only correspondences consistent with the geometric model. */
+-  cv::Mat inliers;
+-  cv::estimateAffinePartial2D (source, target, inliers, cv::RANSAC,
+-                               kRansacReproj, 5000, 0.99);
+-
+-  if (inliers.empty ())
+-    return 0;
+-
+-  return static_cast<guint> (cv::countNonZero (inliers));
++  if (!gallery->have_gallery)
++    {
++      gallery->gallery = gallery_spectrum (gallery->image);
++      gallery->have_gallery = true;
++    }
++  return ncc_masked_fft (probe->probe, gallery->gallery);
+ }
+ catch (const std::exception &)
+ {
+   /* A failed comparison must never authenticate. */
+-  return 0;
++  return 0.0;
+ }
+ 
+ void
+diff --git a/libfprint/drivers/egis0570touch-match.h b/libfprint/drivers/egis0570touch-match.h
+index a6610eb2..ffa4b1c8 100644
+--- a/libfprint/drivers/egis0570touch-match.h
++++ b/libfprint/drivers/egis0570touch-match.h
+@@ -1,10 +1,12 @@
+-/* EXPERIMENTAL: adapted from smox/libfprint-elan-04f3-0c63, commit
+- * 0f18837da8d691946673710d63a81b39d0782fca. Geometry adapted for Egis 0570.
+- * The original ELAN measurements below do NOT validate these parameters
+- * for Egis. Authentication thresholds require independent evaluation.
++/* High-pass NCC matching for the EgisTec 1c7a:0570 touch sensor.
++ *
++ * Replaces the earlier SIFT/RANSAC matcher (which scored genuine same-finger
++ * presses at 0 on real hardware) with a direct image correlation: subtract a
++ * Gaussian low-pass to remove slow shading, z-score, downscale, then search
++ * small rotations and full translations for the best normalised
++ * cross-correlation against each enrolled sample.
+  */
+ /*
+- * Descriptor matching for the ELAN 04f3:0c63 - C interface
+  * Copyright (C) 2026 Michael Brunner
+  *
+  * This library is free software; you can redistribute it and/or
+@@ -26,7 +28,7 @@ G_BEGIN_DECLS
+ /* Ignore edge pixels that are dominated by the sensor border. */
+ #define EGIS0570TOUCH_BORDER 3
+ 
+-/* Opaque handle holding the keypoints and descriptors of one capture. */
++/* Opaque handle holding the preprocessed image of one capture. */
+ typedef struct _Egis0570TouchFeatures Egis0570TouchFeatures;
+ 
+ /**
+@@ -35,21 +37,43 @@ typedef struct _Egis0570TouchFeatures Egis0570TouchFeatures;
+  *   uint16 samples in row order
+  * @frame_count: number of frames captured for this press
+  * @background: the empty-sensor reference of the same session
++ * @prefer_strongest: if %TRUE, pick the frame with the strongest foreground
++ *   signal (used for enrollment, where every frame of the press is
++ *   available); if %FALSE, use the last captured frame (used for
++ *   verification, which only keeps the most recent AUTH_FRAMES)
+  *
+- * Picks the frame yielding the most keypoints and extracts its features.
++ * Builds the high-pass, half-resolution representation of one selected
++ * frame. Returns %NULL if the inputs are structurally invalid, or if the
++ * selected frame carries no measurable signal (e.g. no finger present).
+  *
+  * Returns: (transfer full) (nullable): the features, or %NULL on failure
+  */
+ Egis0570TouchFeatures *fpi_egis0570touch_features_extract (const uint16_t *frames,
+                                              guint           frame_count,
+-                                             const uint16_t *background);
++                                             const uint16_t *background,
++                                             gboolean        prefer_strongest);
++
++/**
++ * fpi_egis0570touch_frame_strength:
++ *
++ * Returns: the amount of finger signal in one raw frame (sum of positive
++ *   frame - background over the cropped area); used to rank the frames of
++ *   a verification burst
++ */
++double fpi_egis0570touch_frame_strength (const uint16_t *frame,
++                                         const uint16_t *background);
+ 
+ /**
+- * fpi_egis0570touch_features_keypoint_count:
++ * fpi_egis0570touch_dump_frames:
+  *
+- * Returns: how many keypoints the capture yielded
++ * Debug aid: when $EGIS0570_DUMP_DIR is set, writes every frame of one press
++ * as <dir>/<usec>_<tag>_f<NN>_raw.pgm (frame stacked over background, 16-bit),
++ * the layout read by scripts/eval_matchers.py. No-op otherwise.
+  */
+-guint fpi_egis0570touch_features_keypoint_count (Egis0570TouchFeatures *features);
++void fpi_egis0570touch_dump_frames (const char     *tag,
++                                    const uint16_t *frames,
++                                    guint           frame_count,
++                                    const uint16_t *background);
+ 
+ /**
+  * fpi_egis0570touch_features_serialise:
+@@ -62,19 +86,24 @@ GBytes *fpi_egis0570touch_features_serialise (Egis0570TouchFeatures *features);
+  * fpi_egis0570touch_features_deserialise:
+  *
+  * Returns: (transfer full) (nullable): the features, or %NULL if the blob is
+- *   malformed or of an unknown version
++ *   malformed or of an unknown version (including the old SIFT-era version 1
++ *   blobs, which must fail closed rather than be mis-decoded as images)
+  */
+ Egis0570TouchFeatures *fpi_egis0570touch_features_deserialise (GBytes *blob);
+ 
+ /**
+  * fpi_egis0570touch_features_compare:
+  *
+- * Matches @probe against @gallery: nearest-neighbour descriptor matching, a
+- * Lowe ratio test, then a RANSAC similarity fit over the surviving pairs.
++ * Matches @probe against @gallery: rotates @gallery over {-15,-10,...,15}
++ * degrees and searches every translation keeping at least 50% overlap,
++ * reporting the largest normalised cross-correlation found. Uses FFT masked
++ * NCC; the Fourier spectra of both sides are computed on first use and
++ * cached inside the features objects (not thread-safe per object).
+  *
+- * Returns: the number of geometrically consistent correspondences
++ * Returns: the best NCC score found, roughly in [-1, 1]; 0 if either
++ *   argument is %NULL or the two images are not comparable
+  */
+-guint fpi_egis0570touch_features_compare (Egis0570TouchFeatures *probe,
++double fpi_egis0570touch_features_compare (Egis0570TouchFeatures *probe,
+                                  Egis0570TouchFeatures *gallery);
+ 
+ void fpi_egis0570touch_features_free (Egis0570TouchFeatures *features);
+diff --git a/libfprint/drivers/egis0570touch.c b/libfprint/drivers/egis0570touch.c
+index 0b6cf079..aa58e4cb 100644
+--- a/libfprint/drivers/egis0570touch.c
++++ b/libfprint/drivers/egis0570touch.c
+@@ -7,15 +7,58 @@
+ #include "drivers_api.h"
+ #include "egis0570touch-proto.h"
+ #include "egis0570touch-match.h"
++#include <errno.h>
++#include <math.h>
++#include <stdlib.h>
++#include <glib/gstdio.h>
+ 
+ #define FRAME_PIXELS (EGIS0570_IMGWIDTH * EGIS0570_IMGHEIGHT)
+ #define MAX_FRAMES 50
+ #define AUTH_FRAMES 10
+-#define ENROLL_STAGES 12
+-#define MIN_FEATURES 20
++#define ENROLL_STAGES 20
+ #define RELEASE_FRAMES 5
+-/* Provisional research threshold, not a measured false-accept guarantee. */
+-#define MATCH_THRESHOLD 12
++/* NCC score threshold, calibrated from scripts/loo_eval.py's overlap>=0.5
++ * run on datasets/collect1 (genuine median 0.725, min 0.37; impostor max
++ * ~0.35 excluding the suspect B_other/1 press -- see REPORT2.md). Override
++ * for field tuning without a rebuild. */
++#define MATCH_THRESHOLD_DEFAULT 0.38
++/* Verification scores these frames of the AUTH_FRAMES burst (chronological
++ * slots) and keeps the best: on the cross-session evaluation in
++ * scripts/xsession_report.py this lifts the genuine accept rate from 80% to
++ * 90% with no impostor above 0.33. */
++static const guint verify_frames[] = { 1, 3, 5, 7, 9 };
++#define N_VERIFY_FRAMES G_N_ELEMENTS (verify_frames)
++
++/* Adaptive templates: a successful verification whose score is far above the
++ * threshold, and which also matches the ORIGINAL enrollment on its own,
++ * appends that capture to a per-print side store so the gallery follows
++ * slow changes of the skin (dryness, season) without re-enrolling.
++ *   - ADAPT_MIN_SCORE: overall best score needed to learn from a capture
++ *   - the capture must reach the match threshold against the original
++ *     enrollment alone, so learned samples can never chain away from it
++ *   - ADAPT_DUP_SCORE: skip captures that duplicate an existing sample
++ *   - at most ADAPT_MAX samples; the oldest is dropped first
++ * The store is keyed by a SHA-256 of the enrolled template, so deleting or
++ * re-enrolling a finger orphans its learned samples automatically. */
++#define ADAPT_MIN_SCORE 0.50
++#define ADAPT_DUP_SCORE 0.85
++#define ADAPT_MAX 20
++#define ADAPT_DIR "/var/lib/fprint/.egis0570-adaptive"
++#define ADAPT_MAGIC 0x31304145u /* "EA01" */
++
++static double
++match_threshold (void)
++{
++  const char *override = getenv ("EGIS0570_NCC_THRESHOLD");
++  if (override && *override)
++    {
++      char *end = NULL;
++      double value = g_ascii_strtod (override, &end);
++      if (end != override && isfinite (value))
++        return value;
++    }
++  return MATCH_THRESHOLD_DEFAULT;
++}
+ 
+ struct _FpDeviceEgis0570Touch
+ {
+@@ -58,34 +101,153 @@ match_data_free (MatchData *data)
+   g_free (data);
+ }
+ 
+-static guint
+-compare_print (Egis0570TouchFeatures *probe, GVariant *data, gboolean stop_on_match,
+-               GCancellable *cancellable)
++static const char *
++adapt_dir (void)
++{
++  const char *dir = getenv ("EGIS0570_ADAPT_DIR");
++  return dir && *dir ? dir : ADAPT_DIR;
++}
++
++static gboolean
++adapt_enabled (void)
++{
++  const char *v = getenv ("EGIS0570_ADAPT");
++  return !(v && g_str_equal (v, "0"));
++}
++
++static char *
++adapt_path (GVariant *template)
++{
++  g_autofree char *sum = g_compute_checksum_for_data (G_CHECKSUM_SHA256,
++                                                      g_variant_get_data (template),
++                                                      g_variant_get_size (template));
++  return g_strdup_printf ("%s/%s.bin", adapt_dir (), sum);
++}
++
++/* Returns the learned blobs of @template (oldest first); empty on any error. */
++static GPtrArray *
++adapt_load (GVariant *template)
++{
++  GPtrArray *out = g_ptr_array_new_with_free_func ((GDestroyNotify) g_bytes_unref);
++  g_autofree char *path = adapt_path (template);
++  g_autofree char *buf = NULL;
++  gsize len = 0, off = 8;
++  if (!g_file_get_contents (path, &buf, &len, NULL) || len < 8)
++    return out;
++  guint32 magic, count;
++  memcpy (&magic, buf, 4);
++  memcpy (&count, buf + 4, 4);
++  magic = GUINT32_FROM_LE (magic);
++  count = GUINT32_FROM_LE (count);
++  if (magic != ADAPT_MAGIC || count > ADAPT_MAX)
++    return out;
++  for (guint32 i = 0; i < count; i++)
++    {
++      guint32 n;
++      if (off + 4 > len)
++        break;
++      memcpy (&n, buf + off, 4);
++      n = GUINT32_FROM_LE (n);
++      off += 4;
++      if (n == 0 || n > len - off)
++        break;
++      g_ptr_array_add (out, g_bytes_new (buf + off, n));
++      off += n;
++    }
++  return out;
++}
++
++static void
++adapt_save (GVariant *template, GPtrArray *blobs)
++{
++  g_autofree char *path = adapt_path (template);
++  g_autoptr(GByteArray) out = g_byte_array_new ();
++  guint first = blobs->len > ADAPT_MAX ? blobs->len - ADAPT_MAX : 0;
++  guint32 v = GUINT32_TO_LE (ADAPT_MAGIC);
++  g_byte_array_append (out, (guint8 *) &v, 4);
++  v = GUINT32_TO_LE (blobs->len - first);
++  g_byte_array_append (out, (guint8 *) &v, 4);
++  for (guint i = first; i < blobs->len; i++)
++    {
++      gsize n;
++      const guint8 *d = g_bytes_get_data (g_ptr_array_index (blobs, i), &n);
++      v = GUINT32_TO_LE ((guint32) n);
++      g_byte_array_append (out, (guint8 *) &v, 4);
++      g_byte_array_append (out, d, n);
++    }
++  g_autoptr(GError) error = NULL;
++  if (g_mkdir_with_parents (adapt_dir (), 0700) != 0 ||
++      !g_file_set_contents_full (path, (const char *) out->data, out->len,
++                                 G_FILE_SET_CONTENTS_CONSISTENT, 0600, &error))
++    fp_warn ("adaptive store write failed: %s", error ? error->message : g_strerror (errno));
++}
++
++/* One enrolled print, decoded once per operation: the original samples and
++ * the learned ones, each as features whose FFT spectra get cached on use. */
++typedef struct
++{
++  GPtrArray *original; /* Egis0570TouchFeatures* */
++  GPtrArray *learned;  /* Egis0570TouchFeatures* */
++  GPtrArray *learned_blobs; /* GBytes*, parallel to learned */
++} Gallery;
++
++static void
++gallery_free (Gallery *g)
++{
++  g_clear_pointer (&g->original, g_ptr_array_unref);
++  g_clear_pointer (&g->learned, g_ptr_array_unref);
++  g_clear_pointer (&g->learned_blobs, g_ptr_array_unref);
++  g_free (g);
++}
++
++static Gallery *
++gallery_load (GVariant *data)
+ {
+   g_autoptr(GVariant) samples = NULL;
+   guint version;
+-  guint best = 0;
+   if (!data || !g_variant_is_of_type (data, G_VARIANT_TYPE ("(uaay)")))
+-    return 0;
++    return NULL;
+   g_variant_get (data, "(u@aay)", &version, &samples);
+   if (version != 1 || g_variant_n_children (samples) != ENROLL_STAGES)
+-    return 0;
++    return NULL;
++  Gallery *g = g_new0 (Gallery, 1);
++  g->original = g_ptr_array_new_with_free_func ((GDestroyNotify) fpi_egis0570touch_features_free);
++  g->learned = g_ptr_array_new_with_free_func ((GDestroyNotify) fpi_egis0570touch_features_free);
++  g->learned_blobs = g_ptr_array_new_with_free_func ((GDestroyNotify) g_bytes_unref);
+   for (gsize i = 0; i < g_variant_n_children (samples); i++)
+     {
+-      if (g_cancellable_is_cancelled (cancellable))
+-        break;
+       g_autoptr(GVariant) sample = g_variant_get_child_value (samples, i);
+       gsize size;
+       const guint8 *bytes = g_variant_get_fixed_array (sample, &size, 1);
+       g_autoptr(GBytes) blob = g_bytes_new (bytes, size);
+-      g_autoptr(Egis0570TouchFeatures) gallery = fpi_egis0570touch_features_deserialise (blob);
+-      guint forward = fpi_egis0570touch_features_compare (probe, gallery);
+-      guint reverse = fpi_egis0570touch_features_compare (gallery, probe);
+-      guint score = MIN (forward, reverse);
+-      fp_dbg ("Sample %zu score %u (experimental threshold %u)", i, score, MATCH_THRESHOLD);
+-      best = MAX (best, score);
+-      if (stop_on_match && best >= MATCH_THRESHOLD)
++      Egis0570TouchFeatures *f = fpi_egis0570touch_features_deserialise (blob);
++      if (f)
++        g_ptr_array_add (g->original, f);
++    }
++  if (adapt_enabled ())
++    {
++      g_autoptr(GPtrArray) blobs = adapt_load (data);
++      for (guint i = 0; i < blobs->len; i++)
++        {
++          Egis0570TouchFeatures *f = fpi_egis0570touch_features_deserialise (g_ptr_array_index (blobs, i));
++          if (!f)
++            continue;
++          g_ptr_array_add (g->learned, f);
++          g_ptr_array_add (g->learned_blobs, g_bytes_ref (g_ptr_array_index (blobs, i)));
++        }
++    }
++  return g;
++}
++
++static double
++best_against (Egis0570TouchFeatures *probe, GPtrArray *set, GCancellable *cancellable)
++{
++  double best = -1.0;
++  for (guint i = 0; set && i < set->len; i++)
++    {
++      if (g_cancellable_is_cancelled (cancellable))
+         break;
++      best = MAX (best, fpi_egis0570touch_features_compare (probe, g_ptr_array_index (set, i)));
+     }
+   return best;
+ }
+@@ -115,48 +277,150 @@ report_retry (FpDevice *dev)
+     }
+ }
+ 
++/* Scores every verification frame against one print. Returns the best
++ * overall score; *best_orig gets the best against the original enrollment
++ * only and *best_frame the probe that produced the overall best. */
++static double
++score_print (GPtrArray *probes, Gallery *g, double threshold, gboolean stop_early,
++             GCancellable *cancellable, double *best_orig, guint *best_frame)
++{
++  double best = -1.0;
++  *best_orig = -1.0;
++  *best_frame = 0;
++  for (guint f = 0; f < probes->len; f++)
++    {
++      Egis0570TouchFeatures *probe = g_ptr_array_index (probes, f);
++      double o = best_against (probe, g->original, cancellable);
++      double l = best_against (probe, g->learned, cancellable);
++      *best_orig = MAX (*best_orig, o);
++      if (MAX (o, l) > best)
++        {
++          best = MAX (o, l);
++          *best_frame = f;
++        }
++      /* Stop once the result can no longer change: accepted and confident
++       * enough to also decide the adaptive update. */
++      if (stop_early && *best_orig >= threshold && best >= ADAPT_MIN_SCORE)
++        break;
++    }
++  return best;
++}
++
++/* Learn @probe into the side store of @template when the match was
++ * confident (@best >= ADAPT_MIN_SCORE), anchored to the original enrollment
++ * (@best_orig >= threshold, so learned samples can never chain away from
++ * it) and not a near-duplicate of an existing sample (@best is already the
++ * probe's best score against original + learned). */
++static void
++maybe_learn (GVariant *template, Gallery *g, Egis0570TouchFeatures *probe,
++             double best, double best_orig, double threshold)
++{
++  if (!adapt_enabled () || best < ADAPT_MIN_SCORE || best_orig < threshold ||
++      best >= ADAPT_DUP_SCORE)
++    return;
++  g_autoptr(GBytes) blob = fpi_egis0570touch_features_serialise (probe);
++  if (!blob)
++    return;
++  g_ptr_array_add (g->learned_blobs, g_bytes_ref (blob));
++  adapt_save (template, g->learned_blobs);
++  fp_info ("adaptive: learned a new sample (score %.3f, %u stored)", best,
++           MIN (g->learned_blobs->len, ADAPT_MAX));
++}
++
+ static void
+ match_frames (GTask *task, gpointer source_object, gpointer task_data,
+               GCancellable *cancellable)
+ {
+   FpDeviceEgis0570Touch *self = source_object;
+   MatchData *data = task_data;
+-  g_autoptr(Egis0570TouchFeatures) features = NULL;
+   gint winner = -1;
+-  guint best = MATCH_THRESHOLD - 1;
++  double threshold = match_threshold ();
++  double best = threshold - 1e-9;
++  gint64 t0 = g_get_monotonic_time ();
+ 
+   /* The USB state machine is paused until this task finishes. */
+   if (g_task_return_error_if_cancelled (task))
+     return;
+-  if (self->frame_count >= AUTH_FRAMES)
+-    features = fpi_egis0570touch_features_extract (self->frames, self->frame_count,
+-                                                 self->background);
+-  if (fpi_egis0570touch_features_keypoint_count (features) < MIN_FEATURES)
++  if (self->frame_count < AUTH_FRAMES)
+     {
+       g_task_return_error (task, fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL));
+       return;
+     }
++  fpi_egis0570touch_dump_frames (data->action == FPI_DEVICE_ACTION_ENROLL ? "e" : "v",
++                                 self->frames, self->frame_count, self->background);
++
+   if (data->action == FPI_DEVICE_ACTION_ENROLL)
+     {
+-      data->enrollment = fpi_egis0570touch_features_serialise (features);
++      g_autoptr(Egis0570TouchFeatures) features =
++        fpi_egis0570touch_features_extract (self->frames, self->frame_count, self->background, TRUE);
++      if (features)
++        data->enrollment = fpi_egis0570touch_features_serialise (features);
+       if (!data->enrollment)
+         {
+           g_task_return_error (task, fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL));
+           return;
+         }
++      g_task_return_int (task, -1);
++      return;
++    }
++
++  g_autoptr(GPtrArray) probes =
++    g_ptr_array_new_with_free_func ((GDestroyNotify) fpi_egis0570touch_features_free);
++  for (guint k = 0; k < N_VERIFY_FRAMES; k++)
++    {
++      guint idx = MIN (verify_frames[k], self->frame_count - 1);
++      Egis0570TouchFeatures *f =
++        fpi_egis0570touch_features_extract (self->frames + idx * FRAME_PIXELS, 1, self->background, FALSE);
++      if (f)
++        g_ptr_array_add (probes, f);
+     }
++  if (probes->len == 0)
++    {
++      g_task_return_error (task, fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL));
++      return;
++    }
++
++  Gallery *win_gallery = NULL;
++  double win_orig = -1.0;
++  guint win_frame = 0;
+   for (guint i = 0; i < data->templates->len; i++)
+     {
+-      if (g_task_return_error_if_cancelled (task))
+-        return;
+-      guint score = compare_print (features, g_ptr_array_index (data->templates, i),
+-                                   data->action == FPI_DEVICE_ACTION_VERIFY, cancellable);
++      if (g_cancellable_is_cancelled (cancellable))
++        break;
++      Gallery *g = gallery_load (g_ptr_array_index (data->templates, i));
++      if (!g)
++        continue;
++      double best_orig;
++      guint best_frame;
++      double score = score_print (probes, g, threshold, TRUE, cancellable, &best_orig, &best_frame);
++      fp_info ("print %u: score %.3f (original-only %.3f, frame %u, %u learned, threshold %.3f)",
++               i, score, best_orig, verify_frames[best_frame], g->learned->len, threshold);
+       if (score > best)
+         {
+           best = score;
+           winner = i;
++          g_clear_pointer (&win_gallery, gallery_free);
++          win_gallery = g;
++          win_orig = best_orig;
++          win_frame = best_frame;
+         }
++      else
++        gallery_free (g);
++      if (winner >= 0 && data->action == FPI_DEVICE_ACTION_VERIFY)
++        break;
++    }
++  if (g_task_return_error_if_cancelled (task))
++    {
++      g_clear_pointer (&win_gallery, gallery_free);
++      return;
++    }
++  if (win_gallery)
++    {
++      maybe_learn (g_ptr_array_index (data->templates, winner), win_gallery,
++                   g_ptr_array_index (probes, win_frame), best, win_orig, threshold);
++      gallery_free (win_gallery);
+     }
++  fp_info ("match done in %.0f ms, winner %d", (g_get_monotonic_time () - t0) / 1000.0, winner);
+   g_task_return_int (task, winner);
+ }
+ 
+diff --git a/tests/egis0570touch-replay.cpp b/tests/egis0570touch-replay.cpp
+new file mode 100644
+index 00000000..63502955
+--- /dev/null
++++ b/tests/egis0570touch-replay.cpp
+@@ -0,0 +1,274 @@
++/* Offline leave-one-out replay of the egis0570touch NCC matcher against a
++ * directory of captured presses, mirroring scripts/loo_eval.py's
++ * overlap>=0.5 run so the two can be diffed score-for-score.
++ *
++ * Usage: egis0570touch-replay <dataset-root>
++ *   <dataset-root>/<A_same|A_move|B_other>/<press>/ (last *_raw.pgm), a P5
++ *   16-bit 114x114 image: top 57 rows = frame, bottom 57 rows = background
++ *   (same layout as scripts/eval_matchers.py). Only the lexicographically
++ *   last *_raw.pgm of each press is used, matching the Python reference's
++ *   P[k][0][-1]/P[k][1].
++ *
++ * Not a pass/fail unit test: it prints genuine/impostor score
++ * distributions and per-verify timings for a human (or REPORT2.md) to read.
++ * LGPL-2.1-or-later. */
++#include "drivers/egis0570touch-match.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <filesystem>
++#include <fstream>
++#include <string>
++#include <vector>
++
++namespace fs = std::filesystem;
++
++namespace {
++
++struct PgmImage
++{
++  int width = 0, height = 0;
++  std::vector<uint16_t> data;
++};
++
++bool
++read_pgm (const fs::path &path, PgmImage &out)
++{
++  std::ifstream f (path, std::ios::binary);
++  if (!f)
++    return false;
++  std::string magic;
++  f >> magic;
++  if (magic != "P5")
++    return false;
++  int width, height, maxval;
++  f >> width >> height >> maxval;
++  f.get (); /* single whitespace byte separating header from binary data */
++  if (!f || width <= 0 || height <= 0)
++    return false;
++
++  out.width = width;
++  out.height = height;
++  out.data.resize (static_cast<size_t> (width) * height);
++  if (maxval > 255)
++    {
++      std::vector<unsigned char> buf (out.data.size () * 2);
++      f.read (reinterpret_cast<char *> (buf.data ()), buf.size ());
++      if (!f)
++        return false;
++      for (size_t i = 0; i < out.data.size (); i++)
++        out.data[i] = static_cast<uint16_t> ((buf[2 * i] << 8) | buf[2 * i + 1]);
++    }
++  else
++    {
++      std::vector<unsigned char> buf (out.data.size ());
++      f.read (reinterpret_cast<char *> (buf.data ()), buf.size ());
++      if (!f)
++        return false;
++      for (size_t i = 0; i < out.data.size (); i++)
++        out.data[i] = buf[i];
++    }
++  return true;
++}
++
++/* Finds the lexicographically-last *_raw.pgm in a press directory, matching
++ * Python's sorted(glob.glob(...))[-1] used by scripts/eval_matchers.py. */
++fs::path
++last_raw_pgm (const fs::path &press_dir)
++{
++  std::vector<fs::path> candidates;
++  for (const auto &entry : fs::directory_iterator (press_dir))
++    {
++      const std::string name = entry.path().filename ().string ();
++      if (name.size () > 8 && name.substr (name.size () - 8) == "_raw.pgm")
++        candidates.push_back (entry.path ());
++    }
++  std::sort (candidates.begin (), candidates.end ());
++  return candidates.empty () ? fs::path () : candidates.back ();
++}
++
++struct Sample
++{
++  std::string label;
++  int press = 0;
++  GBytes *blob = nullptr;
++  Egis0570TouchFeatures *features = nullptr;
++};
++
++double
++elapsed_ms (std::chrono::steady_clock::time_point start)
++{
++  return std::chrono::duration<double, std::milli> (std::chrono::steady_clock::now () - start).count ();
++}
++
++} /* namespace */
++
++int
++main (int argc, char **argv)
++{
++  if (argc != 2)
++    {
++      fprintf (stderr, "usage: %s <dataset-root>\n", argv[0]);
++      return 2;
++    }
++  const fs::path root = argv[1];
++
++  double threshold = 0.38;
++  if (const char *override_ = getenv ("EGIS0570_NCC_THRESHOLD"))
++    threshold = atof (override_);
++
++  std::vector<Sample> samples;
++  for (const char *label : { "A_same", "A_move", "B_other" })
++    {
++      fs::path label_dir = root / label;
++      if (!fs::is_directory (label_dir))
++        {
++          fprintf (stderr, "missing %s under %s\n", label, root.c_str ());
++          return 1;
++        }
++      std::vector<int> presses;
++      for (const auto &entry : fs::directory_iterator (label_dir))
++        if (entry.is_directory ())
++          presses.push_back (atoi (entry.path ().filename ().string ().c_str ()));
++      std::sort (presses.begin (), presses.end ());
++
++      for (int press : presses)
++        {
++          fs::path press_dir = label_dir / std::to_string (press);
++          fs::path raw = last_raw_pgm (press_dir);
++          if (raw.empty ())
++            {
++              /* Fail loudly: a press directory with no raw capture would
++               * otherwise silently shrink the gallery/impostor counts. */
++              fprintf (stderr, "no *_raw.pgm found under %s\n", press_dir.c_str ());
++              return 1;
++            }
++          PgmImage img;
++          if (!read_pgm (raw, img) || img.width != EGIS0570TOUCH_WIDTH ||
++              img.height != 2 * EGIS0570TOUCH_HEIGHT)
++            {
++              fprintf (stderr, "bad pgm: %s\n", raw.c_str ());
++              return 1;
++            }
++          const uint16_t *frame = img.data.data ();
++          const uint16_t *background = img.data.data () + EGIS0570TOUCH_WIDTH * EGIS0570TOUCH_HEIGHT;
++
++          Sample s;
++          s.label = label;
++          s.press = press;
++          Egis0570TouchFeatures *extracted =
++            fpi_egis0570touch_features_extract (frame, 1, background, FALSE);
++          if (!extracted)
++            {
++              fprintf (stderr, "no signal: %s\n", raw.c_str ());
++              return 1;
++            }
++          /* Round-trip through the real storage format, like a stored
++           * enrollment sample would be. */
++          s.blob = fpi_egis0570touch_features_serialise (extracted);
++          fpi_egis0570touch_features_free (extracted);
++          s.features = fpi_egis0570touch_features_deserialise (s.blob);
++          if (!s.features)
++            {
++              fprintf (stderr, "roundtrip failed: %s\n", raw.c_str ());
++              return 1;
++            }
++          samples.push_back (s);
++        }
++    }
++
++  std::vector<Sample *> gallery; /* A_same + A_move: the enrollment pool */
++  std::vector<Sample *> impostors;
++  for (auto &s : samples)
++    {
++      if (s.label == "A_same" || s.label == "A_move")
++        gallery.push_back (&s);
++      else
++        impostors.push_back (&s);
++    }
++
++  printf ("presses: gallery(A_same+A_move)=%zu impostor(B_other)=%zu\n",
++          gallery.size (), impostors.size ());
++
++  std::vector<double> genuine;
++  printf ("\n-- genuine (leave-one-out, max over %zu-1 gallery) --\n", gallery.size ());
++  for (Sample *probe : gallery)
++    {
++      double best = -1.0;
++      for (Sample *g : gallery)
++        {
++          if (g == probe)
++            continue;
++          best = std::max (best, fpi_egis0570touch_features_compare (probe->features, g->features));
++        }
++      genuine.push_back (best);
++      printf ("  %-8s %-3d score=%.4f\n", probe->label.c_str (), probe->press, best);
++    }
++
++  std::vector<double> impostor;
++  std::vector<double> verify_ms;
++  printf ("\n-- impostor (B_other, max over %zu-entry gallery) --\n", gallery.size ());
++  for (Sample *probe : impostors)
++    {
++      auto t0 = std::chrono::steady_clock::now ();
++      double best = -1.0;
++      for (Sample *g : gallery)
++        best = std::max (best, fpi_egis0570touch_features_compare (probe->features, g->features));
++      double ms = elapsed_ms (t0);
++      verify_ms.push_back (ms);
++      impostor.push_back (best);
++      printf ("  %-8s %-3d score=%.4f  (%zu-gallery verify took %.1f ms)\n",
++              probe->label.c_str (), probe->press, best, gallery.size (), ms);
++    }
++
++  auto sorted = [] (std::vector<double> v) { std::sort (v.begin (), v.end ()); return v; };
++  auto median = [] (std::vector<double> v) {
++    std::sort (v.begin (), v.end ());
++    size_t n = v.size ();
++    return n % 2 ? v[n / 2] : (v[n / 2 - 1] + v[n / 2]) / 2.0;
++  };
++
++  std::vector<double> gs = sorted (genuine), is = sorted (impostor);
++  printf ("\ngenuine sorted:  ");
++  for (double v : gs) printf ("%.2f ", v);
++  printf ("\nimpostor sorted: ");
++  for (double v : is) printf ("%.2f ", v);
++  printf ("\n");
++
++  int accept = 0;
++  for (double v : genuine)
++    if (v >= threshold)
++      accept++;
++  printf ("\ngenuine median=%.3f min=%.3f | impostor(incl. B1) median=%.3f max=%.3f\n",
++          median (genuine), gs.empty () ? 0.0 : gs.front (),
++          median (impostor), is.empty () ? 0.0 : is.back ());
++  printf ("genuine accept rate @%.2f: %d/%zu (%.0f%%)\n",
++          threshold, accept, genuine.size (), 100.0 * accept / genuine.size ());
++
++  double impostor_max_excl_b1 = -1.0;
++  for (Sample *probe : impostors)
++    {
++      if (probe->press == 1)
++        continue;
++      double best = -1.0;
++      for (Sample *g : gallery)
++        best = std::max (best, fpi_egis0570touch_features_compare (probe->features, g->features));
++      impostor_max_excl_b1 = std::max (impostor_max_excl_b1, best);
++    }
++  printf ("impostor max EXCLUDING B_other/1: %.4f\n", impostor_max_excl_b1);
++
++  if (!verify_ms.empty ())
++    {
++      double min_ms = *std::min_element (verify_ms.begin (), verify_ms.end ());
++      double max_ms = *std::max_element (verify_ms.begin (), verify_ms.end ());
++      double mean_ms = 0;
++      for (double v : verify_ms) mean_ms += v;
++      mean_ms /= verify_ms.size ();
++      printf ("verify timing (1 probe vs %zu-entry gallery), n=%zu: min=%.1fms mean=%.1fms max=%.1fms\n",
++              gallery.size (), verify_ms.size (), min_ms, mean_ms, max_ms);
++    }
++
++  return 0;
++}
+diff --git a/tests/meson.build b/tests/meson.build
+index 129a386b..6efe5ceb 100644
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -482,4 +482,9 @@ if 'egis0570touch' in drivers
+         dependencies: libfprint_private_dep,
+         link_with: libfprint_drivers)
+     test('egis0570touch-driver', egis_driver_test, suite: 'unit-tests')
++    egis_touch_replay = executable('egis0570touch-replay',
++        'egis0570touch-replay.cpp',
++        dependencies: libfprint_private_dep,
++        link_with: libfprint_drivers,
++        override_options: ['cpp_std=c++17'])
+ endif
+diff --git a/tests/test-egis0570touch-driver.c b/tests/test-egis0570touch-driver.c
+index 398f2182..209c3b19 100644
+--- a/tests/test-egis0570touch-driver.c
++++ b/tests/test-egis0570touch-driver.c
+@@ -147,7 +147,7 @@ worker_match (gconstpointer identify_ptr)
+     memcpy (self->frames + i * FRAME_PIXELS, self->frames, FRAME_PIXELS * sizeof (*self->frames));
+   self->frame_count = AUTH_FRAMES;
+   g_autoptr(Egis0570TouchFeatures) features =
+-    fpi_egis0570touch_features_extract (self->frames, 1, self->background);
++    fpi_egis0570touch_features_extract (self->frames, 1, self->background, TRUE);
+   g_assert_nonnull (features);
+   g_autoptr(GBytes) blob = fpi_egis0570touch_features_serialise (features);
+   g_assert_nonnull (blob);
+@@ -169,10 +169,74 @@ worker_match (gconstpointer identify_ptr)
+   g_assert_true (fp_device_close_sync (FP_DEVICE (self), NULL, NULL));
+ }
+ 
++/* Side-store round trip, keyed per template, capped at ADAPT_MAX, and
++ * picked up by gallery_load(); never touches the real /var/lib/fprint. */
++static void
++adaptive_store (void)
++{
++  g_autofree char *dir = g_dir_make_tmp ("egis-adapt-XXXXXX", NULL);
++  g_assert_nonnull (dir);
++  g_setenv ("EGIS0570_ADAPT_DIR", dir, TRUE);
++  g_setenv ("EGIS0570_ADAPT", "1", TRUE);
++
++  guint16 frame[FRAME_PIXELS], background[FRAME_PIXELS] = { 0 };
++  guint32 state = 42;
++  for (guint i = 0; i < FRAME_PIXELS; i++)
++    {
++      state ^= state << 13; state ^= state >> 17; state ^= state << 5;
++      frame[i] = state & 255;
++    }
++  g_autoptr(Egis0570TouchFeatures) f = fpi_egis0570touch_features_extract (frame, 1, background, TRUE);
++  g_autoptr(GBytes) blob = fpi_egis0570touch_features_serialise (f);
++  gsize size;
++  gconstpointer bytes = g_bytes_get_data (blob, &size);
++  GVariantBuilder builder;
++  g_variant_builder_init (&builder, G_VARIANT_TYPE ("aay"));
++  for (guint i = 0; i < ENROLL_STAGES; i++)
++    g_variant_builder_add_value (&builder, g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, bytes, size, 1));
++  g_autoptr(GVariant) tmpl = g_variant_ref_sink (g_variant_new ("(uaay)", 1u, &builder));
++  g_autoptr(GVariant) other = g_variant_ref_sink (g_variant_new ("(uaay)", 1u, NULL));
++
++  g_autoptr(GPtrArray) blobs = g_ptr_array_new_with_free_func ((GDestroyNotify) g_bytes_unref);
++  for (guint i = 0; i < ADAPT_MAX + 5; i++)
++    g_ptr_array_add (blobs, g_bytes_ref (blob));
++  adapt_save (tmpl, blobs);
++
++  g_autoptr(GPtrArray) loaded = adapt_load (tmpl);
++  g_assert_cmpuint (loaded->len, ==, ADAPT_MAX);
++  g_assert_true (g_bytes_equal (g_ptr_array_index (loaded, 0), blob));
++  g_autoptr(GPtrArray) none = adapt_load (other);
++  g_assert_cmpuint (none->len, ==, 0);
++
++  Gallery *g = gallery_load (tmpl);
++  g_assert_nonnull (g);
++  g_assert_cmpuint (g->original->len, ==, ENROLL_STAGES);
++  g_assert_cmpuint (g->learned->len, ==, ADAPT_MAX);
++  gallery_free (g);
++
++  /* A corrupt store must load as empty, not crash or half-load. */
++  g_autofree char *path = adapt_path (tmpl);
++  g_assert_true (g_file_set_contents (path, "EA01garbage", 11, NULL));
++  g_autoptr(GPtrArray) corrupt = adapt_load (tmpl);
++  g_assert_cmpuint (corrupt->len, ==, 0);
++
++  g_setenv ("EGIS0570_ADAPT", "0", TRUE);
++  g = gallery_load (tmpl);
++  g_assert_cmpuint (g->learned->len, ==, 0);
++  gallery_free (g);
++
++  g_unlink (path);
++  g_rmdir (dir);
++}
++
+ int
+ main (int argc, char **argv)
+ {
+   g_test_init (&argc, &argv, NULL);
++  /* Tests must never read or write the real adaptive store. */
++  g_setenv ("EGIS0570_ADAPT", "0", TRUE);
++  g_unsetenv ("EGIS0570_DUMP_DIR");
++  g_test_add_func ("/egis0570touch/adaptive-store", adaptive_store);
+   g_test_add_data_func ("/egis0570touch/held-touch", GINT_TO_POINTER (FPI_DEVICE_ACTION_VERIFY), capture);
+   g_test_add_data_func ("/egis0570touch/enroll-release", GINT_TO_POINTER (FPI_DEVICE_ACTION_ENROLL), capture);
+   g_test_add_data_func ("/egis0570touch/worker-empty", GINT_TO_POINTER (FALSE), worker);
+diff --git a/tests/test-egis0570touch.cpp b/tests/test-egis0570touch.cpp
+index 5716dc47..6c7a7ab8 100644
+--- a/tests/test-egis0570touch.cpp
++++ b/tests/test-egis0570touch.cpp
+@@ -1,73 +1,210 @@
+-/* Tests of storage and failure handling, not biometric accuracy. LGPL-2.1-or-later. */
++/* Tests of storage and failure handling, not biometric accuracy.
++ * See tests/egis0570touch-replay.cpp for accuracy against real captures.
++ * LGPL-2.1-or-later. */
+ #include "drivers/egis0570touch-match.h"
+ #include <vector>
++#include <cmath>
+ #include <cstring>
+-#include <limits>
++#include <algorithm>
+ 
+-static void empty_input ()
+-{
+-  std::vector<uint16_t> blank (EGIS0570TOUCH_WIDTH * EGIS0570TOUCH_HEIGHT, 100);
+-  g_assert_null (fpi_egis0570touch_features_extract (nullptr, 1, blank.data ()));
+-  g_assert_null (fpi_egis0570touch_features_extract (blank.data (), 0, blank.data ()));
+-  g_assert_null (fpi_egis0570touch_features_extract (blank.data (), 1, blank.data ()));
+-  g_assert_cmpuint (fpi_egis0570touch_features_compare (nullptr, nullptr), ==, 0);
+-  g_assert_null (fpi_egis0570touch_features_deserialise (nullptr));
+-}
++namespace {
+ 
+-static void storage_roundtrip ()
++/* Deterministic xorshift noise, matching the existing driver test's style,
++ * so frames have real (non-flat) variance without needing real captures. */
++std::vector<uint16_t>
++noise_frame (guint32 seed, uint16_t scale = 255)
+ {
+   std::vector<uint16_t> frame (EGIS0570TOUCH_WIDTH * EGIS0570TOUCH_HEIGHT);
+-  std::vector<uint16_t> background (frame.size (), 0);
+-  guint32 state = 123456789;
++  guint32 state = seed;
+   for (auto &pixel : frame)
+     {
+       state ^= state << 13;
+       state ^= state >> 17;
+       state ^= state << 5;
+-      pixel = state & 255;
++      pixel = state % (scale + 1);
+     }
++  return frame;
++}
++
++} // namespace
++
++static void empty_input ()
++{
++  std::vector<uint16_t> blank (EGIS0570TOUCH_WIDTH * EGIS0570TOUCH_HEIGHT, 100);
++  g_assert_null (fpi_egis0570touch_features_extract (nullptr, 1, blank.data (), FALSE));
++  g_assert_null (fpi_egis0570touch_features_extract (blank.data (), 0, blank.data (), FALSE));
++  g_assert_cmpfloat (fpi_egis0570touch_features_compare (nullptr, nullptr), ==, 0.0);
++  g_assert_null (fpi_egis0570touch_features_deserialise (nullptr));
++}
++
++/* A frame identical to the background (no finger, or a perfectly flat
++ * capture) must be rejected rather than scored as a degenerate-but-valid
++ * image: it carries no measurable signal. */
++static void degenerate_signal ()
++{
++  std::vector<uint16_t> flat (EGIS0570TOUCH_WIDTH * EGIS0570TOUCH_HEIGHT, 100);
++  g_assert_null (fpi_egis0570touch_features_extract (flat.data (), 1, flat.data (), FALSE));
++  g_assert_null (fpi_egis0570touch_features_extract (flat.data (), 1, flat.data (), TRUE));
++}
++
++/* prefer_strongest=TRUE must pick whichever frame of the press actually has
++ * signal; prefer_strongest=FALSE must always use the last frame -- this is
++ * the enrollment-vs-verify selection policy described in TASK2. */
++static void frame_selection ()
++{
++  std::vector<uint16_t> background (EGIS0570TOUCH_WIDTH * EGIS0570TOUCH_HEIGHT, 100);
++  std::vector<uint16_t> flat = background;
++  std::vector<uint16_t> real_press = noise_frame (42);
++
++  std::vector<uint16_t> frames;
++  frames.insert (frames.end (), real_press.begin (), real_press.end ()); /* frame 0: signal */
++  frames.insert (frames.end (), flat.begin (), flat.end ());             /* frame 1: flat */
++
++  /* Strongest-frame selection finds frame 0 even though it is not last. */
++  g_autoptr(Egis0570TouchFeatures) strongest =
++    fpi_egis0570touch_features_extract (frames.data (), 2, background.data (), TRUE);
++  g_assert_nonnull (strongest);
++
++  /* Last-frame selection picks the flat frame 1 and must fail. */
++  g_assert_null (fpi_egis0570touch_features_extract (frames.data (), 2, background.data (), FALSE));
++}
++
++static void storage_roundtrip ()
++{
++  std::vector<uint16_t> frame = noise_frame (123456789);
++  std::vector<uint16_t> background (frame.size (), 0);
++
+   g_autoptr(Egis0570TouchFeatures) original =
+-    fpi_egis0570touch_features_extract (frame.data (), 1, background.data ());
++    fpi_egis0570touch_features_extract (frame.data (), 1, background.data (), TRUE);
+   g_assert_nonnull (original);
+   g_autoptr(GBytes) blob = fpi_egis0570touch_features_serialise (original);
+   g_assert_nonnull (blob);
+   g_autoptr(Egis0570TouchFeatures) restored = fpi_egis0570touch_features_deserialise (blob);
+   g_assert_nonnull (restored);
+-  g_assert_cmpuint (fpi_egis0570touch_features_keypoint_count (restored), ==,
+-                   fpi_egis0570touch_features_keypoint_count (original));
+-  guint before = fpi_egis0570touch_features_compare (original, original);
+-  guint after = fpi_egis0570touch_features_compare (original, restored);
+-  g_assert_cmpuint (before, >, 0);
+-  g_assert_cmpuint (before, ==, after);
++
++  double self_score = fpi_egis0570touch_features_compare (original, original);
++  double roundtrip_score = fpi_egis0570touch_features_compare (original, restored);
++  /* Comparing an image against itself with no shift/rotation is a perfect
++   * correlation. */
++  g_assert_cmpfloat (self_score, >, 0.99);
++  /* int16 quantisation must not visibly change the score. */
++  g_assert_cmpfloat (std::fabs (self_score - roundtrip_score), <, 0.01);
+ 
+   gsize size;
+   const auto *bytes = static_cast<const guint8 *> (g_bytes_get_data (blob, &size));
+-  g_assert_cmphex (bytes[0], ==, 0x31);
++  /* magic 0x45543032 little-endian spells "ET02"; version 2. */
++  g_assert_cmphex (bytes[0], ==, 0x32);
+   g_assert_cmphex (bytes[1], ==, 0x30);
+   g_assert_cmphex (bytes[2], ==, 0x54);
+   g_assert_cmphex (bytes[3], ==, 0x45);
+-  g_assert_cmphex (bytes[4], ==, 0x01);
++  g_assert_cmphex (bytes[4], ==, 0x03);
+   g_assert_cmphex (bytes[5], ==, 0x00);
+-  for (gsize len : { gsize (0), gsize (7), size - 1 })
++
++  for (gsize len : { gsize (0), gsize (7), gsize (19), size - 1 })
+     {
+       g_autoptr(GBytes) truncated = g_bytes_new (bytes, len);
+       g_assert_null (fpi_egis0570touch_features_deserialise (truncated));
+     }
++
+   std::vector<guint8> damaged (bytes, bytes + size);
+   damaged[0] ^= 1;
+   g_autoptr(GBytes) wrong_magic = g_bytes_new (damaged.data (), damaged.size ());
+   g_assert_null (fpi_egis0570touch_features_deserialise (wrong_magic));
++
++  /* Corrupting the declared width breaks the magic/size cross-check and
++   * must fail closed rather than read past the buffer. */
+   damaged.assign (bytes, bytes + size);
+-  float invalid = std::numeric_limits<float>::quiet_NaN ();
+-  memcpy (damaged.data () + 8, &invalid, sizeof (invalid));
+-  g_autoptr(GBytes) bad_coordinate = g_bytes_new (damaged.data (), damaged.size ());
+-  g_assert_null (fpi_egis0570touch_features_deserialise (bad_coordinate));
++  damaged[6] = 0xff; damaged[7] = 0xff;
++  g_autoptr(GBytes) bad_dims = g_bytes_new (damaged.data (), damaged.size ());
++  g_assert_null (fpi_egis0570touch_features_deserialise (bad_dims));
++
++  /* An old version-1 (SIFT keypoint blob) template must be rejected, not
++   * misread as image data: it must score 0, prompting re-enrollment. */
++  std::vector<guint8> legacy (8, 0);
++  legacy[0] = 0x31; legacy[1] = 0x30; legacy[2] = 0x54; legacy[3] = 0x45; /* old magic */
++  legacy[4] = 0x01; legacy[5] = 0x00; /* version 1 */
++  g_autoptr(GBytes) legacy_blob = g_bytes_new (legacy.data (), legacy.size ());
++  g_autoptr(Egis0570TouchFeatures) legacy_features =
++    fpi_egis0570touch_features_deserialise (legacy_blob);
++  g_assert_null (legacy_features);
++  g_assert_cmpfloat (fpi_egis0570touch_features_compare (original, legacy_features), ==, 0.0);
++}
++
++/* Two different noise captures must not spuriously correlate above the
++ * threshold just because the comparison never fails outright. */
++static void mismatched_size ()
++{
++  std::vector<uint16_t> frame = noise_frame (7);
++  std::vector<uint16_t> background (frame.size (), 0);
++  g_autoptr(Egis0570TouchFeatures) a =
++    fpi_egis0570touch_features_extract (frame.data (), 1, background.data (), TRUE);
++  g_assert_nonnull (a);
++
++  /* Build a features object from a hand-crafted, differently-sized blob to
++   * exercise the dimension mismatch guard in fpi_egis0570touch_features_compare. */
++  g_autoptr(GBytes) blob = fpi_egis0570touch_features_serialise (a);
++  gsize size;
++  const auto *bytes = static_cast<const guint8 *> (g_bytes_get_data (blob, &size));
++  std::vector<guint8> smaller (bytes, bytes + size);
++  guint16 width = smaller[6] | (smaller[7] << 8);
++  guint16 new_width = width - 1;
++  smaller[6] = new_width & 0xff; smaller[7] = (new_width >> 8) & 0xff;
++  smaller.resize (20 + static_cast<size_t> (new_width) *
++                  (smaller[8] | (smaller[9] << 8)) * 2);
++  g_autoptr(GBytes) smaller_blob = g_bytes_new (smaller.data (), smaller.size ());
++  g_autoptr(Egis0570TouchFeatures) b = fpi_egis0570touch_features_deserialise (smaller_blob);
++  g_assert_nonnull (b);
++  g_assert_cmpfloat (fpi_egis0570touch_features_compare (a, b), ==, 0.0);
++}
++
++/* The FFT matcher must find a pure translation (and a small rotation) of a
++ * capture, and must not correlate two unrelated noise captures. */
++static void shift_and_rotation ()
++{
++  std::vector<uint16_t> big = noise_frame (99);
++  std::vector<uint16_t> background (big.size (), 0);
++  /* Smooth the noise a little so it survives the 0.5x downscale. */
++  std::vector<uint16_t> a (big.size ()), b (big.size ());
++  const int W = EGIS0570TOUCH_WIDTH, H = EGIS0570TOUCH_HEIGHT;
++  auto smooth = [&] (int x, int y) {
++    int s = 0, n = 0;
++    for (int dy = -2; dy <= 2; dy++)
++      for (int dx = -2; dx <= 2; dx++)
++        {
++          int xx = std::clamp (x + dx, 0, W - 1), yy = std::clamp (y + dy, 0, H - 1);
++          s += big[yy * W + xx]; n++;
++        }
++    return static_cast<uint16_t> (s / n);
++  };
++  for (int y = 0; y < H; y++)
++    for (int x = 0; x < W; x++)
++      {
++        a[y * W + x] = smooth (x, y);
++        b[y * W + x] = smooth (std::clamp (x + 8, 0, W - 1), std::clamp (y + 4, 0, H - 1));
++      }
++  g_autoptr(Egis0570TouchFeatures) fa = fpi_egis0570touch_features_extract (a.data (), 1, background.data (), TRUE);
++  g_autoptr(Egis0570TouchFeatures) fb = fpi_egis0570touch_features_extract (b.data (), 1, background.data (), TRUE);
++  g_assert_nonnull (fa);
++  g_assert_nonnull (fb);
++  g_assert_cmpfloat (fpi_egis0570touch_features_compare (fa, fb), >, 0.9);
++  /* Cached spectra must give the same answer on repeated calls. */
++  double s1 = fpi_egis0570touch_features_compare (fa, fb);
++  double s2 = fpi_egis0570touch_features_compare (fa, fb);
++  g_assert_cmpfloat (std::fabs (s1 - s2), <, 1e-12);
++
++  std::vector<uint16_t> other = noise_frame (4242);
++  g_autoptr(Egis0570TouchFeatures) fo = fpi_egis0570touch_features_extract (other.data (), 1, background.data (), TRUE);
++  g_assert_cmpfloat (fpi_egis0570touch_features_compare (fa, fo), <, 0.5);
+ }
+ 
+ int main (int argc, char **argv)
+ {
+   g_test_init (&argc, &argv, nullptr);
+   g_test_add_func ("/egis0570touch/empty-input", empty_input);
++  g_test_add_func ("/egis0570touch/degenerate-signal", degenerate_signal);
++  g_test_add_func ("/egis0570touch/frame-selection", frame_selection);
+   g_test_add_func ("/egis0570touch/storage-roundtrip", storage_roundtrip);
++  g_test_add_func ("/egis0570touch/mismatched-size", mismatched_size);
++  g_test_add_func ("/egis0570touch/shift-and-rotation", shift_and_rotation);
+   return g_test_run ();
+ }

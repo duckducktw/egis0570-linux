@@ -1,0 +1,5 @@
+.tmp/
+datasets/
+*.pgm
+*.npy
+__pycache__/
