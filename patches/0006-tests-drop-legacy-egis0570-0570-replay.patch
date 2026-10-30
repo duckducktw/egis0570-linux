@@ -1,0 +1,27 @@
+From 0891a3232ce4e1dc34d610e0257f93de1a332f14 Mon Sep 17 00:00:00 2001
+From: duckducktw <211126843+duckducktw@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 23:12:26 +0800
+Subject: [PATCH] tests: drop legacy egis0570 replay of a 1c7a:0570 capture
+
+1c7a:0570 is now handled by egis0570touch; the legacy swipe driver keeps
+1c7a:0571 only, so the old 0570 umockdev recording no longer probes a
+capture-capable device. A touch-path replay test is still to be recorded.
+---
+ tests/meson.build | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/tests/meson.build b/tests/meson.build
+index a7e55a5..0759855 100644
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -50,7 +50,6 @@ drivers_tests = {
+     'vfs7552': {},
+     'goodixmoc': {},
+     'nb1010': {},
+-    'egis0570': {},
+     'egismoc': {},
+     'egis_etu905': {},
+     'egismoc-05a1': {},
+-- 
+2.53.0
+

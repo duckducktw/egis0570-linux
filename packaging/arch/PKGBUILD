@@ -1,0 +1,50 @@
+# Maintainer: duckducktw <211126843+duckducktw@users.noreply.github.com>
+# libfprint with the egis0570touch driver for EgisTec 1c7a:0570
+# https://github.com/duckducktw/egis0570-linux
+pkgname=libfprint-egis0570touch
+_pkgname=libfprint
+pkgver=1.94.100
+pkgrel=1
+pkgdesc="libfprint with working support for EgisTec 1c7a:0570 (Acer Swift 2018-2020)"
+url="https://github.com/duckducktw/egis0570-linux"
+arch=(x86_64)
+license=(LGPL-2.1-or-later)
+depends=(libgcc glib2 glibc libgudev libgusb openssl pixman opencv)
+makedepends=(git glib2-devel gobject-introspection gtk-doc meson python-cairo python-gobject systemd)
+checkdepends=(cairo umockdev)
+provides=("libfprint=$pkgver" libfprint-2.so)
+conflicts=(libfprint)
+groups=(fprint)
+_patches=(
+  0001-egis0570-pixman.patch
+  0002-egis0570-touch.patch
+  0003-egis0570-verify-early-exit.patch
+  0004-egis0570-touch-cleanup.patch
+  0005-egis0570touch-ncc-multiframe-adaptive.patch
+  0006-tests-drop-legacy-egis0570-0570-replay.patch
+  0007-egis0570touch-opencv5-geometry-include.patch
+)
+source=("git+https://gitlab.freedesktop.org/libfprint/libfprint.git#tag=v$pkgver"
+        "${_patches[@]}")
+b2sums=('SKIP')
+
+prepare() {
+  cd $_pkgname
+  local p
+  for p in "${_patches[@]}"; do
+    patch -Np1 -i "$srcdir/$p"
+  done
+}
+
+build() {
+  arch-meson $_pkgname build -D drivers=all -D installed-tests=false
+  meson compile -C build
+}
+
+check() {
+  meson test -C build --print-errorlogs
+}
+
+package() {
+  meson install -C build --destdir "$pkgdir"
+}

@@ -3,3 +3,4 @@ datasets/
 *.pgm
 *.npy
 __pycache__/
+out/

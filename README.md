@@ -110,3 +110,9 @@ They need your own captures; set `EGIS0570_DUMP_DIR` to collect them.
   [libfprint!548](https://gitlab.freedesktop.org/libfprint/libfprint/-/merge_requests/548).
 
 LGPL-2.1-or-later, same as libfprint. See `COPYING`.
+
+## Distribution packages
+
+Tested build recipes for Ubuntu (PPA), Fedora (COPR) and Arch (AUR) are in
+[`packaging/`](packaging/README.md); 中文說明見 [`packaging/README.zh-TW.md`](packaging/README.zh-TW.md).
+Rebuild everything in clean containers with `packaging/scripts/build-all.sh`.

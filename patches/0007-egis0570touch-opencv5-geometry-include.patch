@@ -1,0 +1,28 @@
+From de030e85cd03dccea0f9106adede0f560d0a1ffe Mon Sep 17 00:00:00 2001
+From: duckducktw <211126843+duckducktw@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 23:45:56 +0800
+Subject: [PATCH] egis0570touch: include geometry module on OpenCV 5
+
+---
+ libfprint/drivers/egis0570touch-match.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/libfprint/drivers/egis0570touch-match.cpp b/libfprint/drivers/egis0570touch-match.cpp
+index f6dea69b..fe42b3b3 100644
+--- a/libfprint/drivers/egis0570touch-match.cpp
++++ b/libfprint/drivers/egis0570touch-match.cpp
+@@ -23,6 +23,11 @@
+ #include "egis0570touch-match.h"
+ 
+ #include <opencv2/imgproc.hpp>
++#include <opencv2/core/version.hpp>
++#if CV_VERSION_MAJOR >= 5
++/* OpenCV 5 moved getRotationMatrix2D() into the geometry module */
++#include <opencv2/geometry/2d.hpp>
++#endif
+ 
+ #include <algorithm>
+ #include <cmath>
+-- 
+2.53.0
+
