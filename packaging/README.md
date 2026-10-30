@@ -13,6 +13,7 @@ Current state:
 - keno2003 has draft MR
   [!662](https://gitlab.freedesktop.org/libfprint/libfprint/-/merge_requests/662)
   open (touch path + SIFT, i.e. patches 0001–0004). No reviewer comments yet.
+- Coordination with the !662 author: https://github.com/keno2003/libfprint-egis0570/issues/1
 - Patch 0005 should go to that MR as follow-up commits, coordinated with its
   author. A second competing MR for the same device would split review.
 
