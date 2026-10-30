@@ -25,7 +25,7 @@ Usable day to day on the tested laptop, but **experimental**:
 |---|---|---|---|
 | Stock `egis0570` | ~0% | n/a | n/a |
 | SIFT (patches 0001–0004 only) | ~18% | — | ~0.4 s |
-| **This repo (0001–0005)** | **90–95%** | 0.33 (threshold 0.38, 0/9 accepted) | ~0.25 s |
+| **This repo (0001–0007)** | **90–95%** | 0.33 (threshold 0.38, 0/9 accepted) | ~0.25 s |
 
 ## Install (Debian / Ubuntu)
 
@@ -41,6 +41,15 @@ Revert to the distribution library: `./install.sh --revert`.
 
 A distro update of `libfprint` overwrites the installed library. Re-run
 `./install.sh` after such an update.
+
+## Patches 0006–0007
+
+- **0006** drops the legacy `egis0570` umockdev replay test: its recording is a
+  `1c7a:0570` device, which is now owned by `egis0570touch`. Without this the
+  full test suite fails on Ubuntu and Fedora. A touch-path replay test still
+  needs to be recorded.
+- **0007** includes `opencv2/geometry/2d.hpp` on OpenCV 5 (Arch), where
+  `getRotationMatrix2D()` moved out of imgproc.
 
 ## What patch 0005 changes
 
