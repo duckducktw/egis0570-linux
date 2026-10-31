@@ -27,6 +27,7 @@ _patches=(
   0009-egis0570touch-held-finger-gallery-cache.patch
   0010-egis0570touch-safe-defaults.patch
   0011-egis0570touch-drop-stale-threshold.patch
+  0012-egis0570touch-stricter-adaptive.patch
 )
 source=("git+https://gitlab.freedesktop.org/libfprint/libfprint.git#tag=v$pkgver"
         "${_patches[@]}")

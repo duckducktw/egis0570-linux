@@ -951,10 +951,10 @@ index 0000000..829b256
 +#endif
 diff --git a/libfprint/drivers/egis0570touch.c b/libfprint/drivers/egis0570touch.c
 new file mode 100644
-index 0000000..86e2b57
+index 0000000..c400bb5
 --- /dev/null
 +++ b/libfprint/drivers/egis0570touch.c
-@@ -0,0 +1,935 @@
+@@ -0,0 +1,956 @@
 +/*
 + * Egis 0570 press driver. LGPL-2.1-or-later.
 + * USB protocol and initialization derived from the existing egis0570 driver
@@ -994,14 +994,23 @@ index 0000000..86e2b57
 + * appends that capture to a per-print side store so the gallery follows
 + * slow changes of the skin (dryness, season) without re-enrolling.
 + *   - ADAPT_MIN_SCORE: overall best score needed to learn from a capture
-+ *   - the capture must reach the match threshold against the original
-+ *     enrollment alone, so learned samples can never chain away from it
++ *   - ADAPT_ANCHOR_SCORE: the capture must also score this high against the
++ *     original enrollment alone, so learned samples can never chain away
++ *     from it
 + *   - ADAPT_DUP_SCORE: skip captures that duplicate an existing sample
 + *   - at most ADAPT_MAX samples; the oldest is dropped first
++ *   - learned samples accept only at threshold + ADAPT_LEARNED_MARGIN
 + * The store is keyed by a SHA-256 of the enrolled template, so deleting or
 + * re-enrolling a finger orphans its learned samples automatically. */
-+#define ADAPT_MIN_SCORE 0.50
++#define ADAPT_MIN_SCORE 0.60
++#define ADAPT_ANCHOR_SCORE 0.55
 +#define ADAPT_DUP_SCORE 0.85
++/* A match against a learned sample must clear threshold + this margin
++ * (0.49 + 0.11 = 0.60). On scripts/live3_adapt.py, unenrolled fingers scored
++ * up to 0.498 against the grown gallery while staying below 0.468 against the
++ * original enrollment: learned samples cover more skin, so coincidences are
++ * likelier and need a stricter bar. */
++#define ADAPT_LEARNED_MARGIN 0.11
 +#define ADAPT_MAX 20
 +#define ADAPT_DIR "/var/lib/fprint/.egis0570-adaptive"
 +#define ADAPT_MAGIC 0x31304145u /* "EA01" */
@@ -1289,6 +1298,14 @@ index 0000000..86e2b57
 +  return best;
 +}
 +
++/* A learned-sample score, shifted so it competes against the plain threshold
++ * like an original-enrollment score: raw >= threshold + margin to accept. */
++static double
++learned_score (double raw)
++{
++  return raw < -1.0 + 1e-9 ? raw : raw - ADAPT_LEARNED_MARGIN;
++}
++
 +static void
 +report_retry (FpDevice *dev)
 +{
@@ -1316,7 +1333,9 @@ index 0000000..86e2b57
 +
 +/* Scores probes [from, to) against one print, folding into the running
 + * *best / *best_orig / *best_frame (initialise them to -1 / -1 / 0). Probes
-+ * are ordered strongest frame first. Returns the overall best. */
++ * are ordered strongest frame first. Learned-sample scores are lowered by
++ * ADAPT_LEARNED_MARGIN before they compete, so *best is directly comparable
++ * with the threshold. Returns the overall best. */
 +static double
 +score_print (GPtrArray *probes, guint from, guint to, Gallery *g, double threshold,
 +             gboolean stop_early, GCancellable *cancellable,
@@ -1327,7 +1346,7 @@ index 0000000..86e2b57
 +    {
 +      Egis0570TouchFeatures *probe = g_ptr_array_index (probes, f);
 +      double o = best_against (probe, g->original, cancellable);
-+      double l = best_against (probe, g->learned, cancellable);
++      double l = learned_score (best_against (probe, g->learned, cancellable));
 +      *best_orig = MAX (*best_orig, o);
 +      if (MAX (o, l) > best)
 +        {
@@ -1345,15 +1364,17 @@ index 0000000..86e2b57
 +
 +/* Learn @probe into the side store of @template when the match was
 + * confident (@best >= ADAPT_MIN_SCORE), anchored to the original enrollment
-+ * (@best_orig >= threshold, so learned samples can never chain away from
-+ * it) and not a near-duplicate of an existing sample (@best is already the
-+ * probe's best score against original + learned). */
++ * (@best_orig >= ADAPT_ANCHOR_SCORE and >= threshold, so learned samples can
++ * never chain away from it) and not a near-duplicate of an existing sample.
++ * @best has learned scores lowered by ADAPT_LEARNED_MARGIN, so the duplicate
++ * test adds it back (conservative: skips a little more than needed). */
 +static void
 +maybe_learn (GVariant *template, Gallery *g, Egis0570TouchFeatures *probe,
 +             double best, double best_orig, double threshold)
 +{
-+  if (!adapt_enabled () || best < ADAPT_MIN_SCORE || best_orig < threshold ||
-+      best >= ADAPT_DUP_SCORE)
++  if (!adapt_enabled () || best < ADAPT_MIN_SCORE ||
++      best_orig < MAX (threshold, ADAPT_ANCHOR_SCORE) ||
++      best_orig >= ADAPT_DUP_SCORE || best + ADAPT_LEARNED_MARGIN >= ADAPT_DUP_SCORE)
 +    return;
 +  g_autoptr(GBytes) blob = fpi_egis0570touch_features_serialise (probe);
 +  if (!blob)
@@ -1995,10 +2016,10 @@ index 527a795..89c5866 100644
 +endif
 diff --git a/tests/test-egis0570touch-driver.c b/tests/test-egis0570touch-driver.c
 new file mode 100644
-index 0000000..877605e
+index 0000000..dad5556
 --- /dev/null
 +++ b/tests/test-egis0570touch-driver.c
-@@ -0,0 +1,362 @@
+@@ -0,0 +1,380 @@
 +/* Synthetic capture/worker tests, not biometric accuracy tests. LGPL-2.1-or-later.
 + * Include the driver to exercise its private state without exporting test APIs.
 + * USB entry points are replaced; no physical reader or fingerprint data is used.
@@ -2339,6 +2360,23 @@ index 0000000..877605e
 +  g_assert_cmpint (cls->temp_hot_seconds, ==, -1);
 +  g_assert_true (cls->features & FP_DEVICE_FEATURE_ALWAYS_ON);
 +  g_type_class_unref (cls);
++  /* Learned samples accept only at 0.60, learning needs 0.55 vs the original. */
++  g_assert_cmpfloat_with_epsilon (match_threshold () + ADAPT_LEARNED_MARGIN, 0.60, 1e-9);
++  g_assert_cmpfloat (ADAPT_ANCHOR_SCORE, >, match_threshold ());
++  g_assert_cmpfloat (ADAPT_MIN_SCORE, >=, match_threshold () + ADAPT_LEARNED_MARGIN);
++}
++
++/* A press whose only good match is a learned sample: it must reach 0.60
++ * (0.59 would have passed 0.49 before the margin). An empty learned set
++ * (-1) stays -1. */
++static void
++learned_margin (void)
++{
++  double thr = match_threshold ();
++  g_assert_cmpfloat (learned_score (0.59), <, thr);
++  g_assert_cmpfloat (learned_score (0.601), >=, thr);
++  g_assert_cmpfloat (learned_score (0.498), <, thr);   /* field impostor max vs learned */
++  g_assert_cmpfloat_with_epsilon (learned_score (-1.0), -1.0, 1e-12);
 +}
 +
 +int
@@ -2346,6 +2384,7 @@ index 0000000..877605e
 +{
 +  g_test_init (&argc, &argv, NULL);
 +  g_test_add_func ("/egis0570touch/defaults", defaults);
++  g_test_add_func ("/egis0570touch/learned-margin", learned_margin);
 +  /* Tests must never read or write the real adaptive store. */
 +  g_setenv ("EGIS0570_ADAPT", "0", TRUE);
 +  g_unsetenv ("EGIS0570_DUMP_DIR");

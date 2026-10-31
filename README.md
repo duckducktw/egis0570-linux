@@ -34,7 +34,7 @@ Usable day to day on the tested laptop, but **experimental**, and
 | Stock `egis0570` | ~0% | n/a | n/a |
 | SIFT (patches 0001–0004 only) | ~18% | — | ~0.4 s |
 | 0001–0009, threshold 0.38 | ~92% | max 0.468, **12 accepted** | ~0.1 s |
-| **0001–0011, threshold 0.49** | **~78%** | max 0.468, 0 accepted | ~0.1 s |
+| **0001–0012, threshold 0.49** | **~78%** | max 0.468, 0 accepted | ~0.1 s |
 
 ## Install from a release (Ubuntu 26.04 / Fedora 44 / Arch)
 
@@ -63,7 +63,7 @@ Revert to the distribution library: `./install.sh --revert`.
 A distro update of `libfprint` overwrites the installed library. Re-run
 `./install.sh` after such an update.
 
-## Patches 0006–0011
+## Patches 0006–0012
 
 - **0006** drops the legacy `egis0570` umockdev replay test: its recording is a
   `1c7a:0570` device, which is now owned by `egis0570touch`. Without this the
@@ -92,6 +92,8 @@ A distro update of `libfprint` overwrites the installed library. Re-run
   matcher so nobody mistakes it for the live threshold.
   `packaging/scripts/check_port_sync.sh` (run in CI) fails when the Ubuntu
   port drifts from `patches/`.
+- **0012** stricter adaptive learning: learned samples accept at 0.60,
+  learning needs 0.60 overall and 0.55 against the original enrollment.
 
 ## What patch 0005 changes
 
@@ -107,15 +109,18 @@ A distro update of `libfprint` overwrites the installed library. Re-run
    `EGIS0570_ADAPT=1`, a press is learned into a side store
    (`/var/lib/fprint/.egis0570-adaptive/`, max 20, oldest dropped first) only
    if all three conditions hold:
-   - it scored ≥ 0.50;
-   - it matches the **original** enrollment on its own, so learned samples
-     cannot drift away from the real finger;
+   - it scored ≥ 0.60;
+   - it scores ≥ 0.55 against the **original** enrollment on its own, so
+     learned samples cannot drift away from the real finger;
    - it is not a near-duplicate (≥ 0.85) of a stored sample.
 
    Learned samples are genuine, but each one covers another part of the
    finger, which gives an unenrolled finger more chances to line up by
-   coincidence. Both field false accepts came through learned samples, which
-   is why this is opt-in.
+   coincidence. Both field false accepts came through learned samples, so
+   since 0012 a press that only matches a learned sample must reach **0.60**
+   (threshold + 0.11) instead of 0.49. Replaying the owner's presses in time
+   order (`tools/live3_adapt.py`), unenrolled fingers reached up to 0.498
+   against the grown gallery: 0/41 pass 0.60. Still opt-in.
 4. **Enrollment: 12 → 20 touches.**
 5. **No thermal model.** libfprint by default disables a reader after about
    3 minutes of continuous use ("too hot"). The KDE lock screen keeps
