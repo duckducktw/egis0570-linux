@@ -17,5 +17,9 @@ dnf -q -y install umockdev python3-gobject python3-cairo appstream >/dev/null 2>
 AS_VALIDATE_NONET=1 meson test -C "$B" --timeout-multiplier 5 > /out/rpm-test.log 2>&1 || true
 grep -E "^(Ok|Expected Fail|Fail|Skipped|Timeout):" /out/rpm-test.log
 grep -E " FAIL " /out/rpm-test.log | head || true
+# hard gate: any failed or timed-out test fails the build
+if ! grep -qE "^Fail: +0 *$" /out/rpm-test.log || grep -qE "^Timeout: +[1-9]" /out/rpm-test.log; then
+  echo "Fedora test suite failed"; exit 1
+fi
 find ~/rpmbuild/RPMS -name "*.rpm" -exec cp {} /out/ \;
 ls -1 /out/*.rpm

@@ -10,7 +10,10 @@ patches = ['0001-egis0570-pixman.patch', '0002-egis0570-touch.patch',
            '0005-egis0570touch-ncc-multiframe-adaptive.patch',
            '0006-tests-drop-legacy-egis0570-0570-replay.patch',
            '0007-egis0570touch-opencv5-geometry-include.patch',
-           '0008-egis0570touch-faster-verify.patch']
+           '0008-egis0570touch-faster-verify.patch',
+           '0009-egis0570touch-held-finger-gallery-cache.patch',
+           '0010-egis0570touch-safe-defaults.patch',
+           '0011-egis0570touch-drop-stale-threshold.patch']
 lines = ''.join('Patch%d:         %s\n' % (100 + i, n) for i, n in enumerate(patches))
 s = re.sub(r'(Source0:[^\n]*\n)', r'\1\n# egis0570touch: https://github.com/duckducktw/egis0570-linux\n' + lines.replace('\\', '\\\\'), s, count=1)
 s = s.replace('BuildRequires:  libgudev-devel\n',

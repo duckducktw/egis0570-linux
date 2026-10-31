@@ -1,0 +1,89 @@
+name: build-and-release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  port-sync:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Ubuntu port carries the same driver sources as patches/
+        run: bash packaging/scripts/check_port_sync.sh
+
+  build:
+    needs: port-sync
+    name: ${{ matrix.distro }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: ubuntu-26.04
+            image: ubuntu:26.04
+            script: build_deb.sh
+          - distro: fedora-44
+            image: fedora:44
+            script: build_rpm.sh
+          - distro: arch
+            image: archlinux:latest
+            script: build_arch.sh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build and run the distribution test suite
+        run: |
+          mkdir -p out
+          docker run --rm -v "$PWD:/repo:ro" -v "$PWD/out:/out" ${{ matrix.image }} bash /repo/packaging/scripts/${{ matrix.script }}
+      - name: Collect packages
+        run: |
+          mkdir -p dist
+          sudo chown -R "$(id -u)" out
+          find out -maxdepth 1 \( -name "*.deb" -o -name "*.rpm" -o -name "*.pkg.tar.zst" \) -exec cp {} dist/ \;
+          for f in out/*-build.log out/*-test.log; do [ -f "$f" ] && cp "$f" "dist/${{ matrix.distro }}-$(basename "$f")"; done
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.distro }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, "refs/tags/v")
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum *.deb *.rpm *.pkg.tar.zst > SHA256SUMS && cat SHA256SUMS
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="packaging/release-notes/${GITHUB_REF_NAME}.md"
+          [ -f "$notes" ] || notes=/dev/null
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes-file "$notes" dist/* \
+            || gh release upload "$GITHUB_REF_NAME" dist/* --clobber

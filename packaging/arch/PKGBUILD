@@ -24,6 +24,9 @@ _patches=(
   0006-tests-drop-legacy-egis0570-0570-replay.patch
   0007-egis0570touch-opencv5-geometry-include.patch
   0008-egis0570touch-faster-verify.patch
+  0009-egis0570touch-held-finger-gallery-cache.patch
+  0010-egis0570touch-safe-defaults.patch
+  0011-egis0570touch-drop-stale-threshold.patch
 )
 source=("git+https://gitlab.freedesktop.org/libfprint/libfprint.git#tag=v$pkgver"
         "${_patches[@]}")

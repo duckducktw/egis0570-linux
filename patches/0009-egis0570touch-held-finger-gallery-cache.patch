@@ -1,0 +1,293 @@
+From 4e8e0aca3e1152ffb311df722e8a680e5663e39b Mon Sep 17 00:00:00 2001
+From: duckducktw <211126843+duckducktw@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 11:42:58 +0800
+Subject: [PATCH] egis0570touch: capture a finger already resting on the sensor
+ at verify start; cache decoded galleries across operations
+
+---
+ libfprint/drivers/egis0570touch.c | 102 ++++++++++++++++++++++++++++--
+ tests/test-egis0570touch-driver.c |  95 ++++++++++++++++++++++++++++
+ 2 files changed, 193 insertions(+), 4 deletions(-)
+
+diff --git a/libfprint/drivers/egis0570touch.c b/libfprint/drivers/egis0570touch.c
+index bc57389e..4fcf0411 100644
+--- a/libfprint/drivers/egis0570touch.c
++++ b/libfprint/drivers/egis0570touch.c
+@@ -190,17 +190,55 @@ typedef struct
+   GPtrArray *original; /* Egis0570TouchFeatures* */
+   GPtrArray *learned;  /* Egis0570TouchFeatures* */
+   GPtrArray *learned_blobs; /* GBytes*, parallel to learned */
++  gint64 adapt_stamp; /* side-store mtime/size when loaded, -1 if absent */
++  gint refs;
+ } Gallery;
+ 
+ static void
+ gallery_free (Gallery *g)
+ {
++  if (!g || !g_atomic_int_dec_and_test (&g->refs))
++    return;
+   g_clear_pointer (&g->original, g_ptr_array_unref);
+   g_clear_pointer (&g->learned, g_ptr_array_unref);
+   g_clear_pointer (&g->learned_blobs, g_ptr_array_unref);
+   g_free (g);
+ }
+ 
++static Gallery *
++gallery_ref (Gallery *g)
++{
++  g_atomic_int_inc (&g->refs);
++  return g;
++}
++
++/* Decoded galleries (with their lazily computed FFT spectra) survive across
++ * operations, keyed by the SHA-256 of the enrolled template, so an unlock
++ * does not recompute the spectra of every stored sample. An entry is
++ * reloaded when the adaptive side store changed underneath it (deleted,
++ * disabled, rewritten). */
++static GMutex gallery_cache_lock;
++static GHashTable *gallery_cache_table;
++
++static gint64
++adapt_stamp (GVariant *template)
++{
++  if (!adapt_enabled ())
++    return -2;
++  g_autofree char *path = adapt_path (template);
++  GStatBuf st;
++  if (g_stat (path, &st) != 0)
++    return -1;
++  return ((gint64) st.st_mtim.tv_sec * 1000000000 + st.st_mtim.tv_nsec) ^ ((gint64) st.st_size << 40);
++}
++
++static char *
++template_key (GVariant *data)
++{
++  return g_compute_checksum_for_data (G_CHECKSUM_SHA256, g_variant_get_data (data),
++                                      g_variant_get_size (data));
++}
++
+ static Gallery *
+ gallery_load (GVariant *data)
+ {
+@@ -212,6 +250,7 @@ gallery_load (GVariant *data)
+   if (version != 1 || g_variant_n_children (samples) != ENROLL_STAGES)
+     return NULL;
+   Gallery *g = g_new0 (Gallery, 1);
++  g->refs = 1;
+   g->original = g_ptr_array_new_with_free_func ((GDestroyNotify) fpi_egis0570touch_features_free);
+   g->learned = g_ptr_array_new_with_free_func ((GDestroyNotify) fpi_egis0570touch_features_free);
+   g->learned_blobs = g_ptr_array_new_with_free_func ((GDestroyNotify) g_bytes_unref);
+@@ -237,6 +276,41 @@ gallery_load (GVariant *data)
+           g_ptr_array_add (g->learned_blobs, g_bytes_ref (g_ptr_array_index (blobs, i)));
+         }
+     }
++  g->adapt_stamp = adapt_stamp (data);
++  return g;
++}
++
++/* Returns a new reference to the decoded gallery of @data, reusing the one
++ * from earlier operations when the side store has not changed since. */
++static Gallery *
++gallery_get (GVariant *data)
++{
++  if (!data || !g_variant_is_of_type (data, G_VARIANT_TYPE ("(uaay)")))
++    return NULL;
++  g_autofree char *key = template_key (data);
++  gint64 stamp = adapt_stamp (data);
++  g_mutex_lock (&gallery_cache_lock);
++  if (!gallery_cache_table)
++    gallery_cache_table = g_hash_table_new_full (g_str_hash, g_str_equal, g_free,
++                                                 (GDestroyNotify) gallery_free);
++  Gallery *g = g_hash_table_lookup (gallery_cache_table, key);
++  if (g && g->adapt_stamp == stamp)
++    {
++      gallery_ref (g);
++      g_mutex_unlock (&gallery_cache_lock);
++      return g;
++    }
++  g_mutex_unlock (&gallery_cache_lock);
++  g = gallery_load (data);
++  if (!g)
++    return NULL;
++  g_mutex_lock (&gallery_cache_lock);
++  /* Bound the cache: a user has a handful of fingers; anything past that
++   * is stale (deleted/re-enrolled prints whose key never comes back). */
++  if (g_hash_table_size (gallery_cache_table) >= 16)
++    g_hash_table_remove_all (gallery_cache_table);
++  g_hash_table_replace (gallery_cache_table, g_steal_pointer (&key), gallery_ref (g));
++  g_mutex_unlock (&gallery_cache_lock);
+   return g;
+ }
+ 
+@@ -324,6 +398,17 @@ maybe_learn (GVariant *template, Gallery *g, Egis0570TouchFeatures *probe,
+     return;
+   g_ptr_array_add (g->learned_blobs, g_bytes_ref (blob));
+   adapt_save (template, g->learned_blobs);
++  /* Keep the cached gallery in step with the side store: append the new
++   * sample (spectrum computed lazily on its first comparison) and drop the
++   * oldest beyond ADAPT_MAX, matching adapt_save()'s trimming. */
++  Egis0570TouchFeatures *copy = fpi_egis0570touch_features_deserialise (blob);
++  if (copy)
++    g_ptr_array_add (g->learned, copy);
++  while (g->learned_blobs->len > ADAPT_MAX)
++    g_ptr_array_remove_index (g->learned_blobs, 0);
++  while (g->learned->len > ADAPT_MAX)
++    g_ptr_array_remove_index (g->learned, 0);
++  g->adapt_stamp = adapt_stamp (template);
+   fp_info ("adaptive: learned a new sample (score %.3f, %u stored)", best,
+            MIN (g->learned_blobs->len, ADAPT_MAX));
+ }
+@@ -420,7 +505,7 @@ match_frames (GTask *task, gpointer source_object, gpointer task_data,
+         if (pass == 0)
+           {
+             sc[i] = -1.0; orig[i] = -1.0; frame[i] = 0;
+-            gal[i] = gallery_load (g_ptr_array_index (data->templates, i));
++            gal[i] = gallery_get (g_ptr_array_index (data->templates, i));
+           }
+         if (!gal[i])
+           continue;
+@@ -745,16 +830,25 @@ operation_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
+     }
+ }
+ 
++/* Per-operation capture state. Verify/identify: a finger already down at
++ * start is a fresh touch (the screen locker restarts the operation while the
++ * finger stays on the sensor). Only enrollment needs a lift between stages. */
+ static void
+-start_operation (FpDevice *dev)
++reset_capture (FpDeviceEgis0570Touch *self, FpiDeviceAction action)
+ {
+-  FpDeviceEgis0570Touch *self = FPI_DEVICE_EGIS0570TOUCH (dev);
+   self->command = 0;
+   self->initializing = TRUE;
+-  self->wait_for_removal = self->present;
++  self->wait_for_removal = self->present && action == FPI_DEVICE_ACTION_ENROLL;
+   self->finished = FALSE;
+   self->absent_frames = 0;
+   self->frame_count = 0;
++}
++
++static void
++start_operation (FpDevice *dev)
++{
++  FpDeviceEgis0570Touch *self = FPI_DEVICE_EGIS0570TOUCH (dev);
++  reset_capture (self, fpi_device_get_current_action (dev));
+   if (self->calibrated)
+     fpi_device_report_finger_status (dev, self->wait_for_removal ? FP_FINGER_STATUS_PRESENT :
+                                     FP_FINGER_STATUS_NEEDED);
+diff --git a/tests/test-egis0570touch-driver.c b/tests/test-egis0570touch-driver.c
+index 209c3b19..fdc1eeb9 100644
+--- a/tests/test-egis0570touch-driver.c
++++ b/tests/test-egis0570touch-driver.c
+@@ -229,6 +229,98 @@ adaptive_store (void)
+   g_rmdir (dir);
+ }
+ 
++/* Verify/identify started with a finger already down must capture it at once
++ * (the locker restarts the operation under a resting finger); enrollment
++ * still waits for a lift so one touch never fills two stages. */
++static void
++held_at_start (gconstpointer action_ptr)
++{
++  FpiDeviceAction action = GPOINTER_TO_INT (action_ptr);
++  g_autoptr(FpDeviceEgis0570Touch) self = new_device ();
++  FpDevice *dev = FP_DEVICE (self);
++  g_autoptr(FpPrint) print = g_object_ref_sink (fp_print_new (dev));
++  gboolean done = FALSE;
++  self->calibrated = TRUE;
++  memset (self->background, 0, sizeof (self->background));
++  self->present = TRUE; /* previous operation ended with the finger down */
++  if (action == FPI_DEVICE_ACTION_ENROLL)
++    fp_device_enroll (dev, print, NULL, NULL, NULL, NULL, discard_operation, &done);
++  else
++    {
++      fpi_print_set_type (print, FPI_PRINT_RAW);
++      fp_device_verify (dev, print, NULL, NULL, NULL, NULL, discard_operation, &done);
++    }
++  reset_capture (self, action);
++  memset (self->packet, 100, sizeof (self->packet));
++  if (action == FPI_DEVICE_ACTION_ENROLL)
++    {
++      g_assert_true (self->wait_for_removal);
++      g_assert_false (process_packet (dev));
++      g_assert_cmpuint (self->frame_count, ==, 0);
++    }
++  else
++    {
++      g_assert_false (self->wait_for_removal);
++      g_assert_false (process_packet (dev));
++      g_assert_true (process_packet (dev));
++      g_assert_cmpuint (self->frame_count, ==, AUTH_FRAMES);
++    }
++  fpi_device_action_error (dev, fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
++  while (!done)
++    g_main_context_iteration (NULL, TRUE);
++  g_assert_true (fp_device_close_sync (dev, NULL, NULL));
++}
++
++/* The gallery cache returns the same decoded gallery while the side store is
++ * unchanged, and reloads it once the store is rewritten or removed. */
++static void
++gallery_cache (void)
++{
++  g_autofree char *dir = g_dir_make_tmp ("egis-cache-XXXXXX", NULL);
++  g_setenv ("EGIS0570_ADAPT_DIR", dir, TRUE);
++  g_setenv ("EGIS0570_ADAPT", "1", TRUE);
++  guint16 frame[FRAME_PIXELS], background[FRAME_PIXELS] = { 0 };
++  guint32 state = 7;
++  for (guint i = 0; i < FRAME_PIXELS; i++)
++    {
++      state ^= state << 13; state ^= state >> 17; state ^= state << 5;
++      frame[i] = state & 255;
++    }
++  g_autoptr(Egis0570TouchFeatures) f = fpi_egis0570touch_features_extract (frame, 1, background, TRUE);
++  g_autoptr(GBytes) blob = fpi_egis0570touch_features_serialise (f);
++  gsize size;
++  gconstpointer bytes = g_bytes_get_data (blob, &size);
++  GVariantBuilder builder;
++  g_variant_builder_init (&builder, G_VARIANT_TYPE ("aay"));
++  for (guint i = 0; i < ENROLL_STAGES; i++)
++    g_variant_builder_add_value (&builder, g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, bytes, size, 1));
++  g_autoptr(GVariant) tmpl = g_variant_ref_sink (g_variant_new ("(uaay)", 1u, &builder));
++
++  Gallery *a = gallery_get (tmpl), *b = gallery_get (tmpl);
++  g_assert_nonnull (a);
++  g_assert_true (a == b);
++  g_assert_cmpuint (a->learned->len, ==, 0);
++  gallery_free (b);
++
++  g_autoptr(GPtrArray) blobs = g_ptr_array_new_with_free_func ((GDestroyNotify) g_bytes_unref);
++  g_ptr_array_add (blobs, g_bytes_ref (blob));
++  adapt_save (tmpl, blobs);
++  Gallery *c = gallery_get (tmpl);
++  g_assert_true (c != a);
++  g_assert_cmpuint (c->learned->len, ==, 1);
++  gallery_free (a);
++
++  g_autofree char *path = adapt_path (tmpl);
++  g_unlink (path);
++  Gallery *d = gallery_get (tmpl);
++  g_assert_true (d != c);
++  g_assert_cmpuint (d->learned->len, ==, 0);
++  gallery_free (c);
++  gallery_free (d);
++  g_rmdir (dir);
++  g_setenv ("EGIS0570_ADAPT", "0", TRUE);
++}
++
+ int
+ main (int argc, char **argv)
+ {
+@@ -237,6 +329,9 @@ main (int argc, char **argv)
+   g_setenv ("EGIS0570_ADAPT", "0", TRUE);
+   g_unsetenv ("EGIS0570_DUMP_DIR");
+   g_test_add_func ("/egis0570touch/adaptive-store", adaptive_store);
++  g_test_add_func ("/egis0570touch/gallery-cache", gallery_cache);
++  g_test_add_data_func ("/egis0570touch/held-at-start-verify", GINT_TO_POINTER (FPI_DEVICE_ACTION_VERIFY), held_at_start);
++  g_test_add_data_func ("/egis0570touch/held-at-start-enroll", GINT_TO_POINTER (FPI_DEVICE_ACTION_ENROLL), held_at_start);
+   g_test_add_data_func ("/egis0570touch/held-touch", GINT_TO_POINTER (FPI_DEVICE_ACTION_VERIFY), capture);
+   g_test_add_data_func ("/egis0570touch/enroll-release", GINT_TO_POINTER (FPI_DEVICE_ACTION_ENROLL), capture);
+   g_test_add_data_func ("/egis0570touch/worker-empty", GINT_TO_POINTER (FALSE), worker);
+-- 
+2.53.0
+

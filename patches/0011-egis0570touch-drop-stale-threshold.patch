@@ -1,0 +1,28 @@
+From b146bbf493494b1783abdb1405de787ccb2dd81a Mon Sep 17 00:00:00 2001
+From: duckducktw <211126843+duckducktw@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 15:54:34 +0800
+Subject: [PATCH] egis0570touch: drop unused kDefaultThreshold (stale 0.38; the
+ threshold lives in egis0570touch.c)
+
+---
+ libfprint/drivers/egis0570touch-match.cpp | 4 ----
+ 1 file changed, 4 deletions(-)
+
+diff --git a/libfprint/drivers/egis0570touch-match.cpp b/libfprint/drivers/egis0570touch-match.cpp
+index 5e3f233a..fa4bdc1b 100644
+--- a/libfprint/drivers/egis0570touch-match.cpp
++++ b/libfprint/drivers/egis0570touch-match.cpp
+@@ -63,10 +63,6 @@ constexpr double kMinSignalStd = 1e-3;
+ constexpr double kAngles[] = { -15, -10, -5, 0, 5, 10, 15 };
+ constexpr double kMinOverlap = 0.5;
+ 
+-/* Same statistical strictness as v2 at 0.50 (impostor mean + ~6.6 sd on
+- * datasets/collect1); see scripts/fusion_eval.py. */
+-constexpr double kDefaultThreshold = 0.38;
+-
+ constexpr uint32_t kBlobMagic = 0x45543032; /* bytes spell "ET02" */
+ constexpr uint16_t kBlobVersion = 3; /* v3: local contrast normalisation */
+ /* Z-scored values are stored as int16 scaled by this factor; z-scores on
+-- 
+2.53.0
+

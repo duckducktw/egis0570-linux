@@ -1,6 +1,8 @@
-.tmp/
 datasets/
-*.pgm
+.logs/
 *.npy
-__pycache__/
 out/
+*.pgm
+__pycache__/
+TASK_*.md
+.tmp/

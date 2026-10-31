@@ -58,3 +58,29 @@ def ncc_fft(P, G, rx=None, min_overlap=0.5):
 
 def ncc_pair(a, b, rx=None):
     return ncc_fft(probe_spec(a), gallery_spec(b), rx=rx)
+
+def ncc_fft_arg(P, G, min_overlap=0.5):
+    """Like ncc_fft but also returns (angle_index, dy, dx) of the best alignment."""
+    h, w, H, W = P['h'], P['w'], P['H'], P['W']
+    rx = w // 2
+    dys = np.arange(-(h // 2), h // 2 + 1); dxs = np.arange(-rx, rx + 1)
+    iy = dys % H; ix = dxs % W
+    best, arg = -1.0, (0, 0, 0)
+    need = min_overlap * h * w
+    geo = (h - np.abs(dys))[:, None] * (w - np.abs(dxs))[None, :]
+    for ai, (M, B, B2) in enumerate(G):
+        n = np.round(_xcorr(P['A1'], M, H, W)[np.ix_(iy, ix)])
+        Sa = _xcorr(P['A'], M, H, W)[np.ix_(iy, ix)]
+        Saa = _xcorr(P['A2'], M, H, W)[np.ix_(iy, ix)]
+        Sb = _xcorr(P['A1'], B, H, W)[np.ix_(iy, ix)]
+        Sbb = _xcorr(P['A1'], B2, H, W)[np.ix_(iy, ix)]
+        Sab = _xcorr(P['A'], B, H, W)[np.ix_(iy, ix)]
+        ok = (n >= need) & (geo >= need)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            cov = Sab - Sa * Sb / n
+            va = np.maximum(Saa - Sa * Sa / n, 0); vb = np.maximum(Sbb - Sb * Sb / n, 0)
+            r = np.where(ok, cov / np.sqrt(va * vb + 1e-9), -1.0)
+        k = np.unravel_index(np.argmax(r), r.shape)
+        if r[k] > best:
+            best, arg = float(r[k]), (ai, int(dys[k[0]]), int(dxs[k[1]]))
+    return best, arg
