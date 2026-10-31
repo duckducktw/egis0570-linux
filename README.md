@@ -34,7 +34,7 @@ Usable day to day on the tested laptop, but **experimental**, and
 | Stock `egis0570` | ~0% | n/a | n/a |
 | SIFT (patches 0001–0004 only) | ~18% | — | ~0.4 s |
 | 0001–0009, threshold 0.38 | ~92% | max 0.468, **12 accepted** | ~0.1 s |
-| **0001–0012, threshold 0.49** | **~78%** | max 0.468, 0 accepted | ~0.1 s |
+| **0001–0013, threshold 0.49** | **~78%** | max 0.468, 0 accepted | ~0.1 s |
 
 ## Install from a release (Ubuntu 26.04 / Fedora 44 / Arch)
 
@@ -63,7 +63,7 @@ Revert to the distribution library: `./install.sh --revert`.
 A distro update of `libfprint` overwrites the installed library. Re-run
 `./install.sh` after such an update.
 
-## Patches 0006–0012
+## Patches 0006–0013
 
 - **0006** drops the legacy `egis0570` umockdev replay test: its recording is a
   `1c7a:0570` device, which is now owned by `egis0570touch`. Without this the
@@ -94,6 +94,10 @@ A distro update of `libfprint` overwrites the installed library. Re-run
   port drifts from `patches/`.
 - **0012** stricter adaptive learning: learned samples accept at 0.60,
   learning needs 0.60 overall and 0.55 against the original enrollment.
+- **0013** fixes "no fingerprint after resume" when a finger (or a bad first
+  read) was on the sensor as it reopened: the empty-sensor reference was then
+  too high and every touch read as empty. A reference that the empty sensor
+  reads clearly below is now retaken automatically.
 
 ## What patch 0005 changes
 

@@ -1,0 +1,148 @@
+From dffc2639b09d6890f6ea4bc66a6681371abea02e Mon Sep 17 00:00:00 2001
+From: duckducktw <211126843+duckducktw@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 23:35:46 +0800
+Subject: [PATCH] egis0570touch: recalibrate when the empty-sensor reference
+ was taken with a finger down
+
+---
+ libfprint/drivers/egis0570touch.c | 26 ++++++++++-
+ tests/test-egis0570touch-driver.c | 71 +++++++++++++++++++++++++++++++
+ 2 files changed, 96 insertions(+), 1 deletion(-)
+
+diff --git a/libfprint/drivers/egis0570touch.c b/libfprint/drivers/egis0570touch.c
+index c400bb56..14405edd 100644
+--- a/libfprint/drivers/egis0570touch.c
++++ b/libfprint/drivers/egis0570touch.c
+@@ -17,6 +17,12 @@
+ #define AUTH_FRAMES 10
+ #define ENROLL_STAGES 20
+ #define RELEASE_FRAMES 5
++/* Recalibrate when more than RECAL_PIXELS of the 17-row presence band read
++ * more than RECAL_DROP below the reference (5% of 969 pixels). With a correct
++ * reference (the minimum of 5 frames) this does not happen; with one taken
++ * on a finger, 15-22% of the band does (datasets/live3). */
++#define RECAL_DROP 15
++#define RECAL_PIXELS ((17 * EGIS0570_IMGWIDTH) / 20)
+ /* NCC score threshold. 0.38 (calibrated on one 10-press impostor finger) let
+  * unenrolled fingers through in the field: on scripts/live3_eval.py with 41
+  * presses from 4 unenrolled fingers, impostor max is 0.468 and 12 score >= 0.38.
+@@ -653,9 +659,27 @@ process_packet (FpDevice *dev)
+     {
+       const guint8 *frame = self->packet + k * FRAME_PIXELS;
+       double mean = 0;
++      guint below = 0;
+       for (guint i = 20 * EGIS0570_IMGWIDTH; i < 37 * EGIS0570_IMGWIDTH; i++)
+-        mean += MAX (0, (int) frame[i] - self->background[i]);
++        {
++          mean += MAX (0, (int) frame[i] - self->background[i]);
++          below += (int) frame[i] + RECAL_DROP < (int) self->background[i];
++        }
+       mean /= 17 * EGIS0570_IMGWIDTH;
++      /* The empty-sensor reference is the per-pixel minimum of the first
++       * packet after open. If a finger was already down then (common right
++       * after resume) or the first packet was garbage, the reference sits
++       * above the real empty sensor: every touch then reads as "no finger"
++       * until the device is reopened. An empty sensor can only read clearly
++       * BELOW a correct reference, so that is the signal to take a new one.
++       * This only affects presence detection, never matching. */
++      if (!self->present && below > RECAL_PIXELS)
++        {
++          fp_info ("background was taken with something on the sensor; recalibrating");
++          self->calibrated = FALSE;
++          self->wait_for_removal = FALSE;
++          return process_packet (dev);
++        }
+       /* Do not treat one held finger as several operations after a retry. */
+       if (self->wait_for_removal)
+         {
+diff --git a/tests/test-egis0570touch-driver.c b/tests/test-egis0570touch-driver.c
+index dad5556e..c4180523 100644
+--- a/tests/test-egis0570touch-driver.c
++++ b/tests/test-egis0570touch-driver.c
+@@ -357,12 +357,83 @@ learned_margin (void)
+   g_assert_cmpfloat_with_epsilon (learned_score (-1.0), -1.0, 1e-12);
+ }
+ 
++/* A verify running on a fresh device, so finger-status reports are legal. */
++static FpDeviceEgis0570Touch *
++start_verify (FpPrint **print, gboolean *done)
++{
++  FpDeviceEgis0570Touch *self = new_device ();
++  FpDevice *dev = FP_DEVICE (self);
++  *print = g_object_ref_sink (fp_print_new (dev));
++  fpi_print_set_type (*print, FPI_PRINT_RAW);
++  fp_device_verify (dev, *print, NULL, NULL, NULL, NULL, discard_operation, done);
++  reset_capture (self, FPI_DEVICE_ACTION_VERIFY);
++  self->calibrated = FALSE;
++  return self;
++}
++
++static void
++stop_verify (FpDeviceEgis0570Touch *self, FpPrint *print, gboolean *done)
++{
++  FpDevice *dev = FP_DEVICE (self);
++  fpi_device_action_error (dev, fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
++  while (!*done)
++    g_main_context_iteration (NULL, TRUE);
++  g_assert_true (fp_device_close_sync (dev, NULL, NULL));
++  g_object_unref (print);
++  g_object_unref (self);
++}
++
++/* A reference taken with a finger down must not blind the sensor: the next
++ * empty packet reads below it and triggers recalibration, after which a touch
++ * is detected again. */
++static void
++recalibrate_after_bad_reference (void)
++{
++  FpPrint *print;
++  gboolean done = FALSE;
++  FpDeviceEgis0570Touch *self = start_verify (&print, &done);
++  FpDevice *dev = FP_DEVICE (self);
++  memset (self->packet, 100, sizeof (self->packet));   /* finger at open */
++  g_assert_false (process_packet (dev));
++  g_assert_true (self->calibrated);
++  g_assert_cmpuint (self->background[25 * EGIS0570_IMGWIDTH], ==, 100);
++  memset (self->packet, 100, sizeof (self->packet));   /* still held: invisible */
++  g_assert_false (process_packet (dev));
++  g_assert_false (self->present);
++  memset (self->packet, 0, sizeof (self->packet));     /* lifted: reads below */
++  g_assert_false (process_packet (dev));
++  g_assert_cmpuint (self->background[25 * EGIS0570_IMGWIDTH], ==, 0);
++  memset (self->packet, 100, sizeof (self->packet));   /* next touch is seen */
++  g_assert_false (process_packet (dev));
++  g_assert_true (self->present);
++  stop_verify (self, print, &done);
++}
++
++/* Noise around a correct reference must not cause recalibration. */
++static void
++no_recalibrate_on_noise (void)
++{
++  FpPrint *print;
++  gboolean done = FALSE;
++  FpDeviceEgis0570Touch *self = start_verify (&print, &done);
++  FpDevice *dev = FP_DEVICE (self);
++  memset (self->packet, 60, sizeof (self->packet));
++  g_assert_false (process_packet (dev));
++  for (guint i = 0; i < sizeof (self->packet); i++)
++    self->packet[i] = 60 - (i % 7 == 0 ? RECAL_DROP : 3);   /* 1 in 7 at the limit */
++  g_assert_false (process_packet (dev));
++  g_assert_cmpuint (self->background[25 * EGIS0570_IMGWIDTH], ==, 60);
++  stop_verify (self, print, &done);
++}
++
+ int
+ main (int argc, char **argv)
+ {
+   g_test_init (&argc, &argv, NULL);
+   g_test_add_func ("/egis0570touch/defaults", defaults);
+   g_test_add_func ("/egis0570touch/learned-margin", learned_margin);
++  g_test_add_func ("/egis0570touch/recalibrate-bad-reference", recalibrate_after_bad_reference);
++  g_test_add_func ("/egis0570touch/no-recalibrate-on-noise", no_recalibrate_on_noise);
+   /* Tests must never read or write the real adaptive store. */
+   g_setenv ("EGIS0570_ADAPT", "0", TRUE);
+   g_unsetenv ("EGIS0570_DUMP_DIR");
+-- 
+2.53.0
+
