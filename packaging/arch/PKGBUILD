@@ -23,6 +23,7 @@ _patches=(
   0005-egis0570touch-ncc-multiframe-adaptive.patch
   0006-tests-drop-legacy-egis0570-0570-replay.patch
   0007-egis0570touch-opencv5-geometry-include.patch
+  0008-egis0570touch-faster-verify.patch
 )
 source=("git+https://gitlab.freedesktop.org/libfprint/libfprint.git#tag=v$pkgver"
         "${_patches[@]}")

@@ -33,10 +33,10 @@ index 0ff607d..19836c2 100644
  };
 diff --git a/libfprint/drivers/egis0570touch-match.cpp b/libfprint/drivers/egis0570touch-match.cpp
 new file mode 100644
-index 0000000..fe42b3b
+index 0000000..5e3f233
 --- /dev/null
 +++ b/libfprint/drivers/egis0570touch-match.cpp
-@@ -0,0 +1,577 @@
+@@ -0,0 +1,669 @@
 +/*
 + * High-pass NCC matching for the EgisTec 1c7a:0570 touch sensor.
 + * Copyright (C) 2026 Michael Brunner
@@ -76,6 +76,7 @@ index 0000000..fe42b3b
 +#include <exception>
 +#include <limits>
 +#include <memory>
++#include <mutex>
 +#include <vector>
 +#include <glib.h>
 +
@@ -259,35 +260,34 @@ index 0000000..fe42b3b
 + * numerically identical (to ~1e-7) to the brute-force definition in
 + * scripts/acc_harness.py:ncc_shift, verified by scripts/fftncc.py. */
 +
-+/* Probe side: spectra of the image and its square. */
-+struct ProbeSpectrum
++/* The validity mask of a rotated gallery image depends only on the image
++ * size and the angle, never on its content (rotation is the only source of
++ * masked pixels). Everything derived from the mask alone -- its spectrum,
++ * the overlap count and the set of admissible shifts -- is therefore shared
++ * by every sample and every probe, and is computed once per size. */
++struct RotationGeom
++{
++  cv::Mat mask;                /* CV_64F 0/1, h x w */
++  cv::Mat one;                 /* CCS spectrum of mask, padded to H x W */
++  std::vector<int> idx;        /* admissible shifts, iy * W + ix */
++  std::vector<double> inv_cnt; /* 1 / overlap pixel count */
++  std::vector<cv::Rect> rect;  /* gallery pixels overlapping the probe */
++};
++
++struct Geometry
 +{
 +  int h = 0, w = 0, H = 0, W = 0;
-+  cv::Mat val, sq; /* CV_64FC2 */
++  std::vector<RotationGeom> rot;
 +};
 +
-+/* Gallery side, one per rotation: spectra of the validity mask and of the
-+ * masked image, plus the three probe-independent correlation maps (the
-+ * probe's own mask is all ones, identical for every probe of this size). */
-+struct GalleryRotation
-+{
-+  cv::Mat one, val;  /* CV_64FC2 spectra */
-+  cv::Mat n, sb, sbb; /* CV_64F spatial maps, indexed by shift mod (H, W) */
-+};
-+
-+struct GallerySpectrum
-+{
-+  int h = 0, w = 0, H = 0, W = 0;
-+  std::vector<GalleryRotation> rotations;
-+};
-+
++/* Real-input DFT in CCS-packed form (half the work of a complex DFT). */
 +cv::Mat
 +padded_dft (const cv::Mat &x, int H, int W)
 +{
 +  cv::Mat p = cv::Mat::zeros (H, W, CV_64F);
-+  x.copyTo (p (cv::Rect (0, 0, x.cols, x.rows)));
++  x.convertTo (p (cv::Rect (0, 0, x.cols, x.rows)), CV_64F);
 +  cv::Mat f;
-+  cv::dft (p, f, cv::DFT_COMPLEX_OUTPUT);
++  cv::dft (p, f);
 +  return f;
 +}
 +
@@ -301,17 +301,129 @@ index 0000000..fe42b3b
 +  return r;
 +}
 +
++cv::Mat
++rotate_masked (const cv::Mat &b32, double angle)
++{
++  const int h = b32.rows, w = b32.cols;
++  cv::Mat rot = cv::getRotationMatrix2D (cv::Point2f (w / 2.0f, h / 2.0f), angle, 1.0);
++  cv::Mat br;
++  cv::warpAffine (b32, br, rot, cv::Size (w, h), cv::INTER_LINEAR, cv::BORDER_CONSTANT,
++                  cv::Scalar (std::numeric_limits<float>::quiet_NaN ()));
++  return br;
++}
++
++/* Sum of an integral image (CV_64F, (h+1) x (w+1)) over @r. */
++inline double
++box (const cv::Mat &I, const cv::Rect &r)
++{
++  return I.at<double> (r.y + r.height, r.x + r.width) - I.at<double> (r.y, r.x + r.width) -
++         I.at<double> (r.y + r.height, r.x) + I.at<double> (r.y, r.x);
++}
++
++std::unique_ptr<Geometry>
++build_geometry (int h, int w)
++{
++  auto g = std::make_unique<Geometry> ();
++  g->h = h; g->w = w;
++  g->H = cv::getOptimalDFTSize (2 * h);
++  g->W = cv::getOptimalDFTSize (2 * w);
++  const double need = kMinOverlap * h * w;
++  const int max_dy = h / 2, max_dx = w / 2;
++  const cv::Mat ones = cv::Mat::ones (h, w, CV_32F);
++  for (double angle : kAngles)
++    {
++      RotationGeom r;
++      const cv::Mat br = rotate_masked (ones, angle);
++      r.mask = cv::Mat (h, w, CV_64F);
++      for (int y = 0; y < h; y++)
++        for (int x = 0; x < w; x++)
++          r.mask.at<double> (y, x) = std::isnan (br.at<float> (y, x)) ? 0.0 : 1.0;
++      r.one = padded_dft (r.mask, g->H, g->W);
++      cv::Mat I;
++      cv::integral (r.mask, I, CV_64F);
++      for (int dy = -max_dy; dy <= max_dy; dy++)
++        {
++          const int iy = (dy % g->H + g->H) % g->H;
++          const double hh = h - std::abs (dy);
++          for (int dx = -max_dx; dx <= max_dx; dx++)
++            {
++              if (hh * (w - std::abs (dx)) < need)
++                continue;
++              const int ix = (dx % g->W + g->W) % g->W;
++              /* gallery pixels p with p + s inside the h x w probe */
++              const int y0 = std::max (0, -dy), y1 = std::min (h, h - dy);
++              const int x0 = std::max (0, -dx), x1 = std::min (w, w - dx);
++              const cv::Rect rc (x0, y0, x1 - x0, y1 - y0);
++              const double cnt = std::round (box (I, rc));
++              if (cnt < need)
++                continue;
++              r.idx.push_back (iy * g->W + ix);
++              r.inv_cnt.push_back (1.0 / cnt);
++              r.rect.push_back (rc);
++            }
++        }
++      g->rot.push_back (std::move (r));
++    }
++  return g;
++}
++
++const Geometry &
++geometry (int h, int w)
++{
++  static std::mutex lock;
++  static std::vector<std::unique_ptr<Geometry>> cache;
++  std::lock_guard<std::mutex> guard (lock);
++  for (const auto &g : cache)
++    if (g->h == h && g->w == w)
++      return *g;
++  cache.push_back (build_geometry (h, w));
++  return *cache.back ();
++}
++
++/* Probe side, per rotation: the image spectrum plus, for every admissible
++ * shift, the probe's sum and variance over that rotation's overlap. These
++ * only involve the shared mask, so they are computed once per probe rather
++ * than once per (probe, gallery sample) pair. */
++struct ProbeSpectrum
++{
++  int h = 0, w = 0;
++  cv::Mat val; /* CCS spectrum of the probe */
++  std::vector<std::vector<double>> sa, va; /* [rotation][shift] */
++};
++
++/* Gallery side, per rotation: masked-image spectrum, and for every shift its
++ * sum and variance over the overlap. */
++struct GallerySpectrum
++{
++  int h = 0, w = 0;
++  std::vector<cv::Mat> val;
++  std::vector<std::vector<double>> sb, vb;
++};
++
 +ProbeSpectrum
 +probe_spectrum (const cv::Mat &a32)
 +{
 +  ProbeSpectrum s;
 +  s.h = a32.rows; s.w = a32.cols;
-+  s.H = cv::getOptimalDFTSize (2 * s.h);
-+  s.W = cv::getOptimalDFTSize (2 * s.w);
++  const Geometry &geo = geometry (s.h, s.w);
 +  cv::Mat a;
 +  a32.convertTo (a, CV_64F);
-+  s.val = padded_dft (a, s.H, s.W);
-+  s.sq = padded_dft (a.mul (a), s.H, s.W);
++  s.val = padded_dft (a, geo.H, geo.W);
++  const cv::Mat sq = padded_dft (a.mul (a), geo.H, geo.W);
++  for (const RotationGeom &r : geo.rot)
++    {
++      const cv::Mat sa = xcorr (s.val, r.one), saa = xcorr (sq, r.one);
++      const double *pa = sa.ptr<double> (), *paa = saa.ptr<double> ();
++      std::vector<double> va_s (r.idx.size ()), sa_s (r.idx.size ());
++      for (size_t k = 0; k < r.idx.size (); k++)
++        {
++          const double Sa = pa[r.idx[k]];
++          sa_s[k] = Sa;
++          va_s[k] = std::max (paa[r.idx[k]] - Sa * Sa * r.inv_cnt[k], 0.0);
++        }
++      s.sa.push_back (std::move (sa_s));
++      s.va.push_back (std::move (va_s));
++    }
 +  return s;
 +}
 +
@@ -319,37 +431,32 @@ index 0000000..fe42b3b
 +gallery_spectrum (const cv::Mat &b32)
 +{
 +  GallerySpectrum out;
-+  const int h = b32.rows, w = b32.cols;
-+  out.h = h; out.w = w;
-+  out.H = cv::getOptimalDFTSize (2 * h);
-+  out.W = cv::getOptimalDFTSize (2 * w);
-+  const cv::Mat ones = padded_dft (cv::Mat::ones (h, w, CV_64F), out.H, out.W);
-+  for (double angle : kAngles)
++  out.h = b32.rows; out.w = b32.cols;
++  const Geometry &geo = geometry (out.h, out.w);
++  for (size_t ri = 0; ri < geo.rot.size (); ri++)
 +    {
-+      cv::Mat rot = cv::getRotationMatrix2D (cv::Point2f (w / 2.0f, h / 2.0f), angle, 1.0);
-+      cv::Mat br;
-+      cv::warpAffine (b32, br, rot, cv::Size (w, h), cv::INTER_LINEAR, cv::BORDER_CONSTANT,
-+                     cv::Scalar (std::numeric_limits<float>::quiet_NaN ()));
-+      cv::Mat mask (h, w, CV_64F), bz (h, w, CV_64F);
-+      for (int y = 0; y < h; y++)
++      const RotationGeom &r = geo.rot[ri];
++      const cv::Mat br = rotate_masked (b32, kAngles[ri]);
++      cv::Mat bz (out.h, out.w, CV_64F);
++      for (int y = 0; y < out.h; y++)
 +        {
 +          const float *src = br.ptr<float> (y);
-+          double *m = mask.ptr<double> (y), *z = bz.ptr<double> (y);
-+          for (int x = 0; x < w; x++)
-+            {
-+              const bool ok = !std::isnan (src[x]);
-+              m[x] = ok ? 1.0 : 0.0;
-+              z[x] = ok ? src[x] : 0.0;
-+            }
++          double *z = bz.ptr<double> (y);
++          for (int x = 0; x < out.w; x++)
++            z[x] = std::isnan (src[x]) ? 0.0 : src[x];
 +        }
-+      GalleryRotation r;
-+      r.one = padded_dft (mask, out.H, out.W);
-+      r.val = padded_dft (bz, out.H, out.W);
-+      const cv::Mat sq = padded_dft (bz.mul (bz), out.H, out.W);
-+      r.n = xcorr (ones, r.one);
-+      r.sb = xcorr (ones, r.val);
-+      r.sbb = xcorr (ones, sq);
-+      out.rotations.push_back (std::move (r));
++      out.val.push_back (padded_dft (bz, geo.H, geo.W));
++      cv::Mat I, I2;
++      cv::integral (bz, I, I2, CV_64F, CV_64F);
++      std::vector<double> sb (r.idx.size ()), vb (r.idx.size ());
++      for (size_t k = 0; k < r.idx.size (); k++)
++        {
++          const double Sb = box (I, r.rect[k]);
++          sb[k] = Sb;
++          vb[k] = std::max (box (I2, r.rect[k]) - Sb * Sb * r.inv_cnt[k], 0.0);
++        }
++      out.sb.push_back (std::move (sb));
++      out.vb.push_back (std::move (vb));
 +    }
 +  return out;
 +}
@@ -357,38 +464,23 @@ index 0000000..fe42b3b
 +double
 +ncc_masked_fft (const ProbeSpectrum &a, const GallerySpectrum &g)
 +{
-+  const int h = a.h, w = a.w, H = a.H, W = a.W;
-+  if (g.h != h || g.w != w || g.H != H || g.W != W)
++  if (g.h != a.h || g.w != a.w)
 +    return 0.0;
-+  const double need = kMinOverlap * h * w;
-+  const int max_dy = h / 2, max_dx = w / 2;
++  const Geometry &geo = geometry (a.h, a.w);
 +  double best = -1.0;
-+
-+  for (const GalleryRotation &r : g.rotations)
++  for (size_t ri = 0; ri < geo.rot.size (); ri++)
 +    {
-+      const cv::Mat sa = xcorr (a.val, r.one);
-+      const cv::Mat saa = xcorr (a.sq, r.one);
-+      const cv::Mat sab = xcorr (a.val, r.val);
-+      for (int dy = -max_dy; dy <= max_dy; dy++)
++      const RotationGeom &r = geo.rot[ri];
++      const cv::Mat sab = xcorr (a.val, g.val[ri]);
++      const double *pab = sab.ptr<double> ();
++      const double *Sa = a.sa[ri].data (), *va = a.va[ri].data ();
++      const double *Sb = g.sb[ri].data (), *vb = g.vb[ri].data ();
++      for (size_t k = 0; k < r.idx.size (); k++)
 +        {
-+          const int iy = (dy % H + H) % H;
-+          const double hh = h - std::abs (dy);
-+          for (int dx = -max_dx; dx <= max_dx; dx++)
-+            {
-+              if (hh * (w - std::abs (dx)) < need)
-+                continue;
-+              const int ix = (dx % W + W) % W;
-+              const double cnt = std::round (r.n.at<double> (iy, ix));
-+              if (cnt < need)
-+                continue;
-+              const double Sa = sa.at<double> (iy, ix), Sb = r.sb.at<double> (iy, ix);
-+              const double cov = sab.at<double> (iy, ix) - Sa * Sb / cnt;
-+              const double va = std::max (saa.at<double> (iy, ix) - Sa * Sa / cnt, 0.0);
-+              const double vb = std::max (r.sbb.at<double> (iy, ix) - Sb * Sb / cnt, 0.0);
-+              const double v = cov / std::sqrt (va * vb + 1e-9);
-+              if (v > best)
-+                best = v;
-+            }
++          const double cov = pab[r.idx[k]] - Sa[k] * Sb[k] * r.inv_cnt[k];
++          const double v = cov / std::sqrt (va[k] * vb[k] + 1e-9);
++          if (v > best)
++            best = v;
 +        }
 +    }
 +  return best;
@@ -863,10 +955,10 @@ index 0000000..829b256
 +#endif
 diff --git a/libfprint/drivers/egis0570touch.c b/libfprint/drivers/egis0570touch.c
 new file mode 100644
-index 0000000..aa58e4c
+index 0000000..bc57389
 --- /dev/null
 +++ b/libfprint/drivers/egis0570touch.c
-@@ -0,0 +1,787 @@
+@@ -0,0 +1,831 @@
 +/*
 + * Egis 0570 press driver. LGPL-2.1-or-later.
 + * USB protocol and initialization derived from the existing egis0570 driver
@@ -894,7 +986,8 @@ index 0000000..aa58e4c
 +/* Verification scores these frames of the AUTH_FRAMES burst (chronological
 + * slots) and keeps the best: on the cross-session evaluation in
 + * scripts/xsession_report.py this lifts the genuine accept rate from 80% to
-+ * 90% with no impostor above 0.33. */
++ * 90% with no impostor above 0.33. They are tried strongest first, so an
++ * accepting frame is usually found on the first try. */
 +static const guint verify_frames[] = { 1, 3, 5, 7, 9 };
 +#define N_VERIFY_FRAMES G_N_ELEMENTS (verify_frames)
 +
@@ -1146,17 +1239,16 @@ index 0000000..aa58e4c
 +    }
 +}
 +
-+/* Scores every verification frame against one print. Returns the best
-+ * overall score; *best_orig gets the best against the original enrollment
-+ * only and *best_frame the probe that produced the overall best. */
++/* Scores probes [from, to) against one print, folding into the running
++ * *best / *best_orig / *best_frame (initialise them to -1 / -1 / 0). Probes
++ * are ordered strongest frame first. Returns the overall best. */
 +static double
-+score_print (GPtrArray *probes, Gallery *g, double threshold, gboolean stop_early,
-+             GCancellable *cancellable, double *best_orig, guint *best_frame)
++score_print (GPtrArray *probes, guint from, guint to, Gallery *g, double threshold,
++             gboolean stop_early, GCancellable *cancellable,
++             double *best_io, double *best_orig, guint *best_frame)
 +{
-+  double best = -1.0;
-+  *best_orig = -1.0;
-+  *best_frame = 0;
-+  for (guint f = 0; f < probes->len; f++)
++  double best = *best_io;
++  for (guint f = from; f < to && f < probes->len; f++)
 +    {
 +      Egis0570TouchFeatures *probe = g_ptr_array_index (probes, f);
 +      double o = best_against (probe, g->original, cancellable);
@@ -1172,6 +1264,7 @@ index 0000000..aa58e4c
 +      if (stop_early && *best_orig >= threshold && best >= ADAPT_MIN_SCORE)
 +        break;
 +    }
++  *best_io = best;
 +  return best;
 +}
 +
@@ -1235,13 +1328,31 @@ index 0000000..aa58e4c
 +
 +  g_autoptr(GPtrArray) probes =
 +    g_ptr_array_new_with_free_func ((GDestroyNotify) fpi_egis0570touch_features_free);
-+  for (guint k = 0; k < N_VERIFY_FRAMES; k++)
++  guint order[N_VERIFY_FRAMES];
++  double strength[N_VERIFY_FRAMES];
++  guint n_order = N_VERIFY_FRAMES;
++  for (guint k = 0; k < n_order; k++)
 +    {
-+      guint idx = MIN (verify_frames[k], self->frame_count - 1);
++      order[k] = MIN (verify_frames[k], self->frame_count - 1);
++      strength[k] = fpi_egis0570touch_frame_strength (self->frames + order[k] * FRAME_PIXELS, self->background);
++    }
++  /* insertion sort, strongest first, keeping order[] and strength[] paired */
++  for (guint a = 1; a < n_order; a++)
++    for (guint b = a; b > 0 && strength[b] > strength[b - 1]; b--)
++      {
++        guint t = order[b]; order[b] = order[b - 1]; order[b - 1] = t;
++        double u = strength[b]; strength[b] = strength[b - 1]; strength[b - 1] = u;
++      }
++  guint probe_slot[N_VERIFY_FRAMES];
++  for (guint k = 0; k < n_order; k++)
++    {
 +      Egis0570TouchFeatures *f =
-+        fpi_egis0570touch_features_extract (self->frames + idx * FRAME_PIXELS, 1, self->background, FALSE);
++        fpi_egis0570touch_features_extract (self->frames + order[k] * FRAME_PIXELS, 1, self->background, FALSE);
 +      if (f)
-+        g_ptr_array_add (probes, f);
++        {
++          probe_slot[probes->len] = order[k];
++          g_ptr_array_add (probes, f);
++        }
 +    }
 +  if (probes->len == 0)
 +    {
@@ -1249,34 +1360,59 @@ index 0000000..aa58e4c
 +      return;
 +    }
 +
++  /* Pass 1 scores only the strongest frame against every print, so the
++   * enrolled finger that is actually on the sensor is usually accepted after
++   * a single print instead of after all the others were searched in full.
++   * Pass 2 adds the remaining frames for the prints still undecided. */
++  guint n_prints = data->templates->len;
++  g_autofree Gallery **gal = g_new0 (Gallery *, MAX (n_prints, 1));
++  g_autofree double *sc = g_new (double, MAX (n_prints, 1));
++  g_autofree double *orig = g_new (double, MAX (n_prints, 1));
++  g_autofree guint *frame = g_new0 (guint, MAX (n_prints, 1));
++  gboolean stop = FALSE;
++  for (guint pass = 0; pass < 2 && !stop; pass++)
++    for (guint i = 0; i < n_prints && !stop; i++)
++      {
++        if (g_cancellable_is_cancelled (cancellable))
++          {
++            stop = TRUE;
++            break;
++          }
++        if (pass == 0)
++          {
++            sc[i] = -1.0; orig[i] = -1.0; frame[i] = 0;
++            gal[i] = gallery_load (g_ptr_array_index (data->templates, i));
++          }
++        if (!gal[i])
++          continue;
++        /* Pass 2 only matters when pass 1 did not settle this print. */
++        if (pass == 1 && orig[i] >= threshold && sc[i] >= ADAPT_MIN_SCORE)
++          continue;
++        score_print (probes, pass == 0 ? 0 : 1, pass == 0 ? 1 : probes->len, gal[i],
++                     threshold, TRUE, cancellable, &sc[i], &orig[i], &frame[i]);
++        fp_info ("pass %u print %u: score %.3f (original-only %.3f, frame %u, %u learned, threshold %.3f)",
++                 pass + 1, i, sc[i], orig[i], probe_slot[frame[i]], gal[i]->learned->len, threshold);
++        if (sc[i] > best)
++          {
++            best = sc[i];
++            winner = i;
++          }
++        if (winner >= 0 && data->action == FPI_DEVICE_ACTION_VERIFY)
++          stop = TRUE;
++      }
 +  Gallery *win_gallery = NULL;
 +  double win_orig = -1.0;
 +  guint win_frame = 0;
-+  for (guint i = 0; i < data->templates->len; i++)
++  for (guint i = 0; i < n_prints; i++)
 +    {
-+      if (g_cancellable_is_cancelled (cancellable))
-+        break;
-+      Gallery *g = gallery_load (g_ptr_array_index (data->templates, i));
-+      if (!g)
-+        continue;
-+      double best_orig;
-+      guint best_frame;
-+      double score = score_print (probes, g, threshold, TRUE, cancellable, &best_orig, &best_frame);
-+      fp_info ("print %u: score %.3f (original-only %.3f, frame %u, %u learned, threshold %.3f)",
-+               i, score, best_orig, verify_frames[best_frame], g->learned->len, threshold);
-+      if (score > best)
++      if ((gint) i == winner)
 +        {
-+          best = score;
-+          winner = i;
-+          g_clear_pointer (&win_gallery, gallery_free);
-+          win_gallery = g;
-+          win_orig = best_orig;
-+          win_frame = best_frame;
++          win_gallery = gal[i];
++          win_orig = orig[i];
++          win_frame = frame[i];
 +        }
-+      else
-+        gallery_free (g);
-+      if (winner >= 0 && data->action == FPI_DEVICE_ACTION_VERIFY)
-+        break;
++      else if (gal[i])
++        gallery_free (gal[i]);
 +    }
 +  if (g_task_return_error_if_cancelled (task))
 +    {

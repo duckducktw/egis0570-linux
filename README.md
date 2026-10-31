@@ -25,7 +25,7 @@ Usable day to day on the tested laptop, but **experimental**:
 |---|---|---|---|
 | Stock `egis0570` | ~0% | n/a | n/a |
 | SIFT (patches 0001–0004 only) | ~18% | — | ~0.4 s |
-| **This repo (0001–0007)** | **90–95%** | 0.33 (threshold 0.38, 0/9 accepted) | ~0.25 s |
+| **This repo (0001–0008)** | **90–95%** | 0.33 (threshold 0.38, 0/9 accepted) | ~0.1 s |
 
 ## Install (Debian / Ubuntu)
 
@@ -42,7 +42,7 @@ Revert to the distribution library: `./install.sh --revert`.
 A distro update of `libfprint` overwrites the installed library. Re-run
 `./install.sh` after such an update.
 
-## Patches 0006–0007
+## Patches 0006–0008
 
 - **0006** drops the legacy `egis0570` umockdev replay test: its recording is a
   `1c7a:0570` device, which is now owned by `egis0570touch`. Without this the
@@ -50,6 +50,14 @@ A distro update of `libfprint` overwrites the installed library. Re-run
   needs to be recorded.
 - **0007** includes `opencv2/geometry/2d.hpp` on OpenCV 5 (Arch), where
   `getRotationMatrix2D()` moved out of imgproc.
+- **0008** makes verification about 4x faster with bit-identical scores
+  (900/900 real probe x sample pairs unchanged; 20-sample gallery 52 ms ->
+  13.5 ms on an i5-7200U). The rotation validity mask depends only on image
+  size and angle, so its spectrum, overlap counts and admissible shifts are
+  computed once and shared; probe-side sums/variances are computed once per
+  probe and gallery-side ones from integral images, leaving one inverse FFT
+  per rotation per comparison instead of three. The strongest frame is tried
+  against every enrolled finger before the remaining frames.
 
 ## What patch 0005 changes
 
